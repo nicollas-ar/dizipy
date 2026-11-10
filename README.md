@@ -59,7 +59,7 @@ O túnel expõe o receptor da porta 5001. O painel e o checkout continuam na por
 
 - Em **URL**, use o endereço HTTPS do ngrok com `/webhooks/asaas` no final.
 - Depois de preencher a URL, rode `Set-Clipboard -Value $env:ASAAS_WEBHOOK_TOKEN` no PowerShell original e cole o valor em **Auth Token**. É um token próprio do webhook.
-- Preencha o nome e o e-mail de alerta, mantenha o webhook e a fila ativos e selecione apenas o evento `PAYMENT_RECEIVED`.
+- Preencha o nome e o e-mail de alerta, mantenha o webhook e a fila ativos e selecione os eventos `PAYMENT_RECEIVED` e `PAYMENT_CONFIRMED`.
 
 Salve o webhook e inicie o painel no PowerShell original:
 
@@ -71,8 +71,22 @@ Crie uma cobrança Pix nova no Dizipy e simule a confirmação no Asaas. Com a p
 
 Ao encerrar o teste, desative o webhook temporário no Asaas e feche o túnel. Para reutilizá-lo, mantenha o mesmo token configurado no Asaas e em `ASAAS_WEBHOOK_TOKEN`, e atualize a URL se ela mudar.
 
+## Testar cartão avulso no Sandbox
+
+Antes de atualizar, pare os dois processos Flask (painel na porta 5000 e receptor na porta 5001). Atualize a branch e reinicie cada processo na mesma janela em que suas variáveis já estão configuradas. A migração do banco local preserva as cobranças Pix existentes.
+
+1. No webhook do Asaas Sandbox, mantenha `PAYMENT_RECEIVED` marcado e acrescente `PAYMENT_CONFIRMED`. Salve.
+2. No link de contribuição, selecione **Cartão avulso · Asaas Sandbox**, informe um valor de teste e clique em **Gerar pagamento com cartão**.
+3. Abra **Pagar com cartão no Asaas Sandbox**. A fatura abre em outra aba. Use somente dados fictícios e um dos [cartões oficiais de teste do Asaas](https://docs.asaas.com/docs/testando-pagamento-com-cart%C3%A3o-de-cr%C3%A9dito).
+4. Para testar aprovação, use `4539656048392220`, validade futura, CCV `123` e nome fictício. Para testar recusa em outra cobrança, use `5184019740373151`.
+5. Volte à aba do Dizipy para acompanhar a confirmação automática. O painel e o CSV incluem somente as contribuições confirmadas. Uma recusa deve manter a contribuição pendente.
+
+O cartão avulso é confirmado quando o Asaas informar `CONFIRMED` ou `RECEIVED`. A confirmação do pagamento e a disponibilidade do saldo são etapas distintas. O Pix continua exigindo `RECEIVED`. O líquido do painel permanece simulado e desconta somente a taxa Dizipy do protótipo.
+
+A fatura de teste aceita somente um endereço HTTPS do domínio `sandbox.asaas.com`. Os dados do cartão são preenchidos no Asaas. O cliente fictício configurado no Sandbox é reutilizado neste protótipo.
+
 ## Escopo desta versão
 
-O QR Code abre o simulador web. Sem as variáveis do Asaas, as quatro formas usam o simulador local. Com o Sandbox configurado, só o Pix avulso usa a API do Asaas. O painel salva o dia e horário do lembrete, mas o envio ainda não está ligado.
+O QR Code abre o simulador web. Sem as variáveis do Asaas, as quatro formas usam o simulador local. Com o Sandbox configurado, Pix avulso e cartão avulso usam a API do Asaas. O painel salva o dia e horário do lembrete, mas o envio ainda não está ligado.
 
 O próximo passo inclui conectar Meta e IA, adicionar permissões por colaborador, ativação após verificação da conta de recebimento e execução dos lembretes com a regra de contato mensal. O piloto usa PostgreSQL no Neon e um workspace separado no Render. Esta versão local é exclusivamente para testes fictícios.

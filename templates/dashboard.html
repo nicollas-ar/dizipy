@@ -51,11 +51,11 @@
         {% for row in donations %}
           <tr>
             <td>{{ row.amount | money }}</td>
-            <td>{{ methods[row.method] }}{% if row.sandbox_pix %} · Asaas Sandbox{% endif %}</td>
+            <td>{{ methods[row.method] }}{% if row.sandbox_payment %} · Asaas Sandbox{% endif %}</td>
             <td>
-              {{ ("Pago" if row.sandbox_pix else "Confirmado") if row.paid_at else "Pendente" }}
-              {% if row.sandbox_pix and not row.paid_at %}
-                <a href="{{ url_for('demo_payment', donation_id=row.id) }}">Retomar teste Pix</a>
+              {{ ("Pago" if row.sandbox_payment else "Confirmado") if row.paid_at else "Pendente" }}
+              {% if row.sandbox_payment and not row.paid_at %}
+                <a href="{{ url_for('demo_payment', donation_id=row.id) }}">Retomar pagamento de teste</a>
               {% endif %}
             </td>
           </tr>
@@ -64,7 +64,7 @@
     </table></div>
   {% else %}<p class="muted">As contribuições simuladas aparecem aqui.</p>{% endif %}
 </section>
-{% if webhook_enabled and donations | selectattr('sandbox_pix') | rejectattr('paid_at') | list %}
+{% if webhook_enabled and donations | selectattr('sandbox_payment') | rejectattr('paid_at') | list %}
   <script defer src="{{ url_for('static', filename='pix-status.js') }}" data-pix-version="{{ totals.count }}" data-edit-form="parish-preferences"></script>
 {% endif %}
 {% endblock %}

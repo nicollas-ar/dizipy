@@ -8,6 +8,7 @@ from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
 from io import BytesIO, StringIO
 from pathlib import Path
+from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
 import click
@@ -26,6 +27,7 @@ METHODS = {
     "card_monthly": "Cartão recorrente",
     "pix_monthly": "Pix Automático",
 }
+ASAAS_METHODS = {"pix": "PIX", "card": "CREDIT_CARD"}
 SAO_PAULO = ZoneInfo("America/Sao_Paulo")
 
 
@@ -45,14 +47,20 @@ def parse_amount(value):
     return cents if cents > 0 else None
 
 
-def matches_pix_payment(payment, donation):
+def matches_payment(payment, donation):
     value = payment.get("value")
     return (
         payment.get("id") == donation["payment_id"]
         and payment.get("externalReference") == "dizipy-" + donation["id"]
-        and payment.get("billingType") == "PIX"
+        and payment.get("billingType") == ASAAS_METHODS.get(donation["method"])
         and type(value) in (int, float)
         and Decimal(str(value)) * 100 == donation["amount"]
+    )
+
+
+def payment_confirmed(payment, donation):
+    return payment.get("status") == "RECEIVED" or (
+        donation["method"] == "card" and payment.get("status") == "CONFIRMED"
     )
 
 
@@ -92,6 +100,13 @@ def create_app(config=None, *, webhook_only=False):
             connection.close()
 
     with app.app_context():
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            legacy_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'asaas_pix'"
+            ).fetchone()
+            if legacy_table:
+                connection.execute("ALTER TABLE asaas_pix RENAME TO asaas_payment")
         db().executescript("""
             CREATE TABLE IF NOT EXISTS parish (
                 id INTEGER PRIMARY KEY,
@@ -112,7 +127,7 @@ def create_app(config=None, *, webhook_only=False):
                 created_at TEXT NOT NULL,
                 paid_at TEXT
             );
-            CREATE TABLE IF NOT EXISTS asaas_pix (
+            CREATE TABLE IF NOT EXISTS asaas_payment (
                 donation_id TEXT PRIMARY KEY REFERENCES donation(id),
                 payment_id TEXT UNIQUE
             );
@@ -259,8 +274,8 @@ def create_app(config=None, *, webhook_only=False):
         if request.args.get("pix_status") == "1":
             return {"version": totals["count"]}
         donations = connection.execute("""
-            SELECT donation.*, asaas_pix.donation_id IS NOT NULL AS sandbox_pix
-            FROM donation LEFT JOIN asaas_pix ON asaas_pix.donation_id = donation.id
+            SELECT donation.*, asaas_payment.donation_id IS NOT NULL AS sandbox_payment
+            FROM donation LEFT JOIN asaas_payment ON asaas_payment.donation_id = donation.id
             WHERE parish_id = ? ORDER BY created_at DESC LIMIT 20
         """, (parish["id"],)).fetchall()
         connection.commit()
@@ -313,8 +328,8 @@ def create_app(config=None, *, webhook_only=False):
                         "INSERT INTO donation (id, parish_id, amount, platform_fee, method, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                         (donation_id, parish["id"], amount, fee, method, now().isoformat()),
                     )
-                    if sandbox_enabled and method == "pix":
-                        connection.execute("INSERT INTO asaas_pix (donation_id) VALUES (?)", (donation_id,))
+                    if sandbox_enabled and method in ASAAS_METHODS:
+                        connection.execute("INSERT INTO asaas_payment (donation_id) VALUES (?)", (donation_id,))
                 session["demo_donation"] = donation_id
                 return redirect(url_for("demo_payment", donation_id=donation_id))
         return render_template("contribute.html", parish=parish, enabled=enabled, sandbox_enabled=sandbox_enabled)
@@ -323,19 +338,19 @@ def create_app(config=None, *, webhook_only=False):
     def demo_payment(donation_id):
         donation = db().execute("""
             SELECT donation.*, parish.name AS parish_name,
-                   asaas_pix.donation_id IS NOT NULL AS sandbox_pix, asaas_pix.payment_id
+                   asaas_payment.donation_id IS NOT NULL AS sandbox_payment, asaas_payment.payment_id
             FROM donation JOIN parish ON parish.id = donation.parish_id
-            LEFT JOIN asaas_pix ON asaas_pix.donation_id = donation.id WHERE donation.id = ?
+            LEFT JOIN asaas_payment ON asaas_payment.donation_id = donation.id WHERE donation.id = ?
         """, (donation_id,)).fetchone()
         if donation is None:
             abort(404)
         owns_checkout = session.get("demo_donation") == donation_id
         manages_sandbox_checkout = (
-            donation["sandbox_pix"] and session.get("parish_id") == donation["parish_id"]
+            donation["sandbox_payment"] and session.get("parish_id") == donation["parish_id"]
         )
         if not (owns_checkout or manages_sandbox_checkout):
             abort(404)
-        if donation["sandbox_pix"]:
+        if donation["sandbox_payment"]:
             if request.method == "GET" and request.args.get("pix_status") == "1":
                 return {"version": int(donation["paid_at"] is not None)}
             return sandbox_payment(donation)
@@ -362,7 +377,7 @@ def create_app(config=None, *, webhook_only=False):
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict) or not isinstance(payload.get("event"), str):
             abort(400)
-        if payload["event"] != "PAYMENT_RECEIVED":
+        if payload["event"] not in ("PAYMENT_RECEIVED", "PAYMENT_CONFIRMED"):
             return {"received": True}
 
         event_id = payload.get("id")
@@ -378,12 +393,12 @@ def create_app(config=None, *, webhook_only=False):
             if connection.execute("SELECT 1 FROM asaas_webhook_event WHERE id = ?", (event_id,)).fetchone():
                 return {"received": True}
             donation = connection.execute("""
-                SELECT donation.id, donation.amount, asaas_pix.payment_id
-                FROM asaas_pix JOIN donation ON donation.id = asaas_pix.donation_id
-                WHERE asaas_pix.payment_id = ?
+                SELECT donation.id, donation.amount, donation.method, asaas_payment.payment_id
+                FROM asaas_payment JOIN donation ON donation.id = asaas_payment.donation_id
+                WHERE asaas_payment.payment_id = ?
             """, (payment_id,)).fetchone()
             if donation is not None:
-                if payment.get("status") == "RECEIVED" and matches_pix_payment(payment, donation):
+                if payment_confirmed(payment, donation) and matches_payment(payment, donation):
                     mark_paid(connection, donation["id"])
                     connection.execute(
                         "INSERT INTO asaas_webhook_event (id, donation_id) VALUES (?, ?)",
@@ -401,7 +416,7 @@ def create_app(config=None, *, webhook_only=False):
         with db() as connection:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT payment_id FROM asaas_pix WHERE donation_id = ?", (donation["id"],),
+                "SELECT payment_id FROM asaas_payment WHERE donation_id = ?", (donation["id"],),
             ).fetchone()
             if row["payment_id"]:
                 return
@@ -413,7 +428,7 @@ def create_app(config=None, *, webhook_only=False):
                 raise asaas.AsaasError("Não foi possível identificar uma única cobrança no Sandbox.")
             payment = matches[0] if matches else asaas.call(api_key, "POST", "/payments", data={
                 "customer": customer_id,
-                "billingType": "PIX",
+                "billingType": ASAAS_METHODS[donation["method"]],
                 "value": donation["amount"] / 100,
                 "dueDate": now().date().isoformat(),
                 "description": "Contribuição de teste Dizipy",
@@ -425,11 +440,12 @@ def create_app(config=None, *, webhook_only=False):
             if not isinstance(payment_id, str) or not re.fullmatch(r"pay_[A-Za-z0-9_]+", payment_id):
                 raise asaas.AsaasError("O Asaas Sandbox não devolveu um identificador de cobrança válido.")
             connection.execute(
-                "UPDATE asaas_pix SET payment_id = ? WHERE donation_id = ?", (payment_id, donation["id"]),
+                "UPDATE asaas_payment SET payment_id = ? WHERE donation_id = ?", (payment_id, donation["id"]),
             )
 
     def sandbox_payment(donation):
         qr = None
+        invoice_url = None
         payment_id = donation["payment_id"]
         if not donation["paid_at"]:
             if not sandbox_enabled:
@@ -439,9 +455,9 @@ def create_app(config=None, *, webhook_only=False):
                     if request.method == "POST":
                         if payment_id:
                             payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
-                            if not matches_pix_payment(payment, donation):
+                            if not matches_payment(payment, donation):
                                 raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
-                            if payment.get("status") == "RECEIVED":
+                            if payment_confirmed(payment, donation):
                                 with db() as connection:
                                     mark_paid(connection, donation["id"])
                             else:
@@ -450,13 +466,26 @@ def create_app(config=None, *, webhook_only=False):
                             create_sandbox_charge(donation)
                     elif payment_id:
                         payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
-                        if not matches_pix_payment(payment, donation):
+                        if not matches_payment(payment, donation):
                             raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
-                        if payment.get("status") == "RECEIVED":
+                        if payment_confirmed(payment, donation):
                             with db() as connection:
                                 mark_paid(connection, donation["id"])
                             return redirect(url_for("demo_payment", donation_id=donation["id"]))
-                        qr = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}/pixQrCode")
+                        if donation["method"] == "pix":
+                            qr = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}/pixQrCode")
+                        else:
+                            candidate_url = payment.get("invoiceUrl")
+                            if not isinstance(candidate_url, str):
+                                raise asaas.AsaasError("O Asaas não retornou o link da fatura de teste.")
+                            try:
+                                parsed_url = urlsplit(candidate_url)
+                            except ValueError:
+                                raise asaas.AsaasError("O Asaas retornou um endereço de fatura inválido.") from None
+                            if (parsed_url.scheme != "https"
+                                    or parsed_url.netloc not in ("sandbox.asaas.com", "sandbox.asaas.com:443")):
+                                raise asaas.AsaasError("O Asaas retornou um endereço de fatura inesperado.")
+                            invoice_url = candidate_url
                 except asaas.AsaasError as error:
                     flash(str(error))
                 except sqlite3.OperationalError as error:
@@ -465,7 +494,7 @@ def create_app(config=None, *, webhook_only=False):
                     flash("O Dizipy está finalizando outra tentativa. Tente novamente.")
         if request.method == "POST":
             return redirect(url_for("demo_payment", donation_id=donation["id"]))
-        return render_template("payment.html", donation=donation, qr=qr, sandbox_enabled=sandbox_enabled)
+        return render_template("payment.html", donation=donation, qr=qr, invoice_url=invoice_url, sandbox_enabled=sandbox_enabled)
 
     return app
 

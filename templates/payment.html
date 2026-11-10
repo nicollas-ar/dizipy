@@ -2,20 +2,30 @@
 {% block title %}Confirmação · Dizipy{% endblock %}
 {% block content %}
 <section class="card narrow">
-  {% if donation.sandbox_pix %}
-    <p class="eyebrow">Pix · Asaas Sandbox</p>
+  {% if donation.sandbox_payment %}
+    <p class="eyebrow">{{ methods[donation.method] }} · Asaas Sandbox</p>
   {% else %}
     <p class="eyebrow">{{ "Comprovante simulado" if donation.paid_at else "Revise antes de confirmar" }}</p>
   {% endif %}
   <h1>{{ donation.amount | money }}</h1>
   <p>{{ donation.parish_name }} · {{ methods[donation.method] }}</p>
-  {% if donation.sandbox_pix %}
+  {% if donation.sandbox_payment %}
     {% if donation.paid_at %}
       <p class="notice">Pago no Asaas Sandbox. Nenhum dinheiro real foi movimentado.</p>
+      {% if donation.method == "card" %}
+        <p class="muted">O pagamento foi confirmado. Consulte a disponibilidade do saldo no Asaas.</p>
+      {% endif %}
     {% else %}
-      <p class="muted">Cobrança de teste. Confirme o pagamento no painel do Asaas Sandbox.</p>
+      {% if donation.method == "card" %}
+        <p class="muted">Pague com um cartão fictício na página de testes do Asaas. Depois volte aqui para acompanhar a confirmação.</p>
+      {% else %}
+        <p class="muted">Cobrança de teste. Confirme o pagamento no painel do Asaas Sandbox.</p>
+      {% endif %}
       {% if donation.payment_id %}
         <p>Pendente · {{ donation.payment_id }}</p>
+        {% if invoice_url %}
+          <p><a class="link" href="{{ invoice_url }}" target="_blank" rel="noopener noreferrer">Pagar com cartão no Asaas Sandbox</a></p>
+        {% endif %}
         {% if qr and qr.encodedImage and qr.payload %}
           <img class="qr" width="180" height="180" src="data:image/png;base64,{{ qr.encodedImage }}" alt="QR Code Pix de teste">
           <label>Pix Copia e Cola<input type="text" value="{{ qr.payload }}" readonly></label>
@@ -24,7 +34,7 @@
       {% if sandbox_enabled %}
         <form method="post">
           <input type="hidden" name="csrf" value="{{ csrf_token() }}">
-          <button>{{ "Consultar pagamento" if donation.payment_id else "Gerar Pix de teste" }}</button>
+          <button>{% if donation.payment_id %}Consultar pagamento{% elif donation.method == "card" %}Gerar pagamento com cartão{% else %}Gerar Pix de teste{% endif %}</button>
         </form>
       {% endif %}
     {% endif %}
@@ -39,7 +49,7 @@
   {% endif %}
   <p><a href="{{ url_for('home') }}">Voltar ao início</a></p>
 </section>
-{% if webhook_enabled and donation.sandbox_pix and donation.payment_id and not donation.paid_at %}
+{% if webhook_enabled and donation.sandbox_payment and donation.payment_id and not donation.paid_at %}
   <script defer src="{{ url_for('static', filename='pix-status.js') }}" data-pix-version="0"></script>
 {% endif %}
 {% endblock %}
