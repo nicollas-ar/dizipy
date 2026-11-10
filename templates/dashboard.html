@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Painel · Dizipy{% endblock %}
+{% block content %}
+<div class="top heading">
+  <div><p class="eyebrow">Painel da paróquia</p><h1>{{ parish.name }}</h1></div>
+  <form method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}"><button class="secondary">Sair</button>
+  </form>
+</div>
+<div class="grid metrics">
+  <section class="card"><p>Arrecadação confirmada</p><strong>{{ totals.gross | money }}</strong></section>
+  <section class="card"><p>Taxa Dizipy · 0,5%</p><strong>{{ totals.fee | money }}</strong></section>
+  <section class="card"><p>Líquido simulado</p><strong>{{ (totals.gross - totals.fee) | money }}</strong></section>
+</div>
+<div class="grid settings">
+  <section class="card">
+    <h2>Link de contribuição</h2>
+    <p class="muted">Escaneie o QR Code para abrir o simulador no celular.</p>
+    <img class="qr" width="160" height="160" src="{{ url_for('parish_qr', public_id=parish.public_id) }}" alt="QR Code da página de contribuição simulada">
+    <a class="link" href="{{ url_for('contribute', public_id=parish.public_id) }}">Abrir contribuição simulada</a>
+    <a class="link" href="{{ url_for('parish_qr', public_id=parish.public_id) }}" download="dizipy-qr.png">Baixar QR Code</a>
+  </section>
+  <section class="card">
+    <h2>Preferências</h2>
+    <form method="post">
+      <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+      <fieldset>
+        <legend>Formas disponíveis</legend>
+        {% for key, name in methods.items() %}
+          <label class="check"><input type="checkbox" name="methods" value="{{ key }}" {% if key in parish.methods.split(',') %}checked{% endif %}> {{ name }}</label>
+        {% endfor %}
+      </fieldset>
+      <fieldset>
+        <legend>Lembrete mensal</legend>
+        <div class="grid time">
+          <label>Dia do mês<input type="number" name="day" value="{{ parish.reminder_day }}" min="1" max="31" required></label>
+          <label>Horário de Brasília<input type="time" name="time" value="{{ parish.reminder_time }}" required></label>
+        </div>
+        <small>O envio automático será conectado em uma próxima etapa.</small>
+      </fieldset>
+      <button>Salvar preferências</button>
+    </form>
+  </section>
+</div>
+<section class="card">
+  <div class="top"><h2>Contribuições recentes</h2><a href="{{ url_for('export_donations') }}">Exportar CSV</a></div>
+  {% if donations %}
+    <div class="scroll"><table>
+      <thead><tr><th>Valor</th><th>Forma</th><th>Status</th></tr></thead>
+      <tbody>{% for row in donations %}<tr><td>{{ row.amount | money }}</td><td>{{ methods[row.method] }}</td><td>{{ "Confirmado" if row.paid_at else "Pendente" }}</td></tr>{% endfor %}</tbody>
+    </table></div>
+  {% else %}<p class="muted">As contribuições simuladas aparecem aqui.</p>{% endif %}
+</section>
+{% endblock %}

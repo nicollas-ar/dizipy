@@ -1,0 +1,15 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="card narrow">
+  <h1>{{ "Cadastre sua paróquia" if register else "Entre no painel" }}</h1>
+  <p class="muted">Use dados fictícios para experimentar o Dizipy.</p>
+  <form method="post" action="{{ url_for('register' if register else 'login') }}">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    {% if register %}<label>Nome da paróquia<input name="name" autocomplete="organization" required maxlength="120"></label>{% endif %}
+    <label>E-mail<input type="email" name="email" autocomplete="username" required maxlength="254"></label>
+    <label>Senha<input type="password" name="password" autocomplete="{{ 'new-password' if register else 'current-password' }}" required maxlength="128" {% if register %}minlength="10"{% endif %}></label>
+    <button>{{ "Criar conta de teste" if register else "Entrar" }}</button>
+  </form>
+  <p>{% if register %}<a href="{{ url_for('home') }}">Voltar para a entrada</a>{% else %}<a href="{{ url_for('register') }}">Cadastrar paróquia</a>{% endif %}</p>
+</section>
+{% endblock %}
