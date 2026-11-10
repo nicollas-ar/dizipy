@@ -17,7 +17,23 @@ def call(api_key, method, path, *, data=None, params=None):
             allow_redirects=False,
         )
         if not 200 <= response.status_code < 300:
-            raise AsaasError(f"Asaas Sandbox respondeu com HTTP {response.status_code}.")
+            message = f"Asaas Sandbox respondeu com HTTP {response.status_code}."
+            try:
+                body = response.json()
+            except ValueError:
+                body = {}
+            errors = body.get("errors") if isinstance(body, dict) else None
+            if isinstance(errors, list):
+                descriptions = [
+                    error["description"] for error in errors[:3]
+                    if isinstance(error, dict) and isinstance(error.get("description"), str)
+                ]
+                detail = " ".join(" ".join(descriptions).split())
+                if api_key:
+                    detail = detail.replace(api_key, "[chave omitida]")
+                if detail:
+                    message += " " + detail[:500]
+            raise AsaasError(message)
         result = response.json()
     except requests.Timeout:
         raise AsaasError("O Asaas Sandbox demorou a responder. Tente consultar novamente.") from None
