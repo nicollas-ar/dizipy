@@ -449,6 +449,13 @@ def create_app(config=None, *, webhook_only=False):
                         else:
                             create_sandbox_charge(donation)
                     elif payment_id:
+                        payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
+                        if not matches_pix_payment(payment, donation):
+                            raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
+                        if payment.get("status") == "RECEIVED":
+                            with db() as connection:
+                                mark_paid(connection, donation["id"])
+                            return redirect(url_for("demo_payment", donation_id=donation["id"]))
                         qr = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}/pixQrCode")
                 except asaas.AsaasError as error:
                     flash(str(error))
