@@ -39,4 +39,7 @@
   {% endif %}
   <p><a href="{{ url_for('home') }}">Voltar ao início</a></p>
 </section>
+{% if webhook_enabled and donation.sandbox_pix and donation.payment_id and not donation.paid_at %}
+  <script defer src="{{ url_for('static', filename='pix-status.js') }}" data-pix-version="0"></script>
+{% endif %}
 {% endblock %}

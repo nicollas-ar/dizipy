@@ -38,10 +38,41 @@ O comando `asaas-cliente-teste` cria um cadastro fictício no Sandbox com as not
 2. No painel do Asaas Sandbox, abra a cobrança usando a referência `pay_...` mostrada no Dizipy e simule a confirmação do pagamento.
 3. No Dizipy, toque em **Consultar pagamento**. Quando a API indicar o recebimento, atualize o painel da paróquia para ver **Pago**. Os totais e o CSV passam a incluir essa contribuição, com a mesma taxa simulada do protótipo.
 
-A URL da API aponta apenas para o Sandbox. A consulta é manual para o teste na rede local. A confirmação automática por webhook fica para a próxima etapa. O Pix do Sandbox usa um cliente fictício compartilhado apenas neste ambiente de teste.
+A URL da API aponta apenas para o Sandbox. O Pix usa um cliente fictício compartilhado neste ambiente de teste. A consulta manual continua disponível.
+
+## Testar a confirmação automática por webhook
+
+Use o Asaas Sandbox e mantenha a chave da API e o ID de cliente já configurados. No mesmo PowerShell, pare o Flask com `Ctrl+C` e rode na pasta do projeto:
+
+```powershell
+$env:ASAAS_WEBHOOK_TOKEN = .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_hex(32))"
+Start-Process -FilePath (Resolve-Path .\.venv\Scripts\python.exe).Path -ArgumentList '-m flask --app app:create_webhook_app run --host 127.0.0.1 --port 5001 --no-debugger --no-reload'
+```
+
+Com o [ngrok para Windows](https://ngrok.com/download/windows) instalado e configurado com o token da sua conta ngrok, abra outro PowerShell e rode:
+
+```powershell
+ngrok http http://127.0.0.1:5001
+```
+
+O túnel expõe o receptor da porta 5001. O painel e o checkout continuam na porta 5000 da rede local. No Asaas Sandbox, vá em **Menu do usuário → Integrações → Webhooks → Criar Webhook**.
+
+- Em **URL**, use o endereço HTTPS do ngrok com `/webhooks/asaas` no final.
+- Depois de preencher a URL, rode `Set-Clipboard -Value $env:ASAAS_WEBHOOK_TOKEN` no PowerShell original e cole o valor em **Auth Token**. É um token próprio do webhook.
+- Preencha o nome e o e-mail de alerta, mantenha o webhook e a fila ativos e selecione apenas o evento `PAYMENT_RECEIVED`.
+
+Salve o webhook e inicie o painel no PowerShell original:
+
+```powershell
+.\.venv\Scripts\python.exe -m flask --app app run --host 0.0.0.0
+```
+
+Crie uma cobrança Pix nova no Dizipy e simule a confirmação no Asaas. Com a página de pagamento ou o painel aberto, aguarde alguns segundos até aparecer **Pago**. As telas consultam o banco local. Se você estiver editando as preferências do painel, salve ou recarregue a página para ver a mudança. Nos **Logs de Webhooks** do Asaas, a entrega correspondente deve retornar HTTP 200.
+
+Ao encerrar o teste, desative o webhook temporário no Asaas e feche o túnel. Para reutilizá-lo, mantenha o mesmo token configurado no Asaas e em `ASAAS_WEBHOOK_TOKEN`, e atualize a URL se ela mudar.
 
 ## Escopo desta versão
 
 O QR Code abre o simulador web. Sem as variáveis do Asaas, as quatro formas usam o simulador local. Com o Sandbox configurado, só o Pix avulso usa a API do Asaas. O painel salva o dia e horário do lembrete, mas o envio ainda não está ligado.
 
-O próximo passo inclui conectar Meta e IA, automatizar a confirmação do Asaas por webhook, adicionar permissões por colaborador, ativação após verificação da conta de recebimento e execução dos lembretes com a regra de contato mensal. O piloto usa PostgreSQL no Neon e um workspace separado no Render. Esta versão local é exclusivamente para testes fictícios.
+O próximo passo inclui conectar Meta e IA, adicionar permissões por colaborador, ativação após verificação da conta de recebimento e execução dos lembretes com a regra de contato mensal. O piloto usa PostgreSQL no Neon e um workspace separado no Render. Esta versão local é exclusivamente para testes fictícios.

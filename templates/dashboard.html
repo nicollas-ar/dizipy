@@ -22,7 +22,7 @@
   </section>
   <section class="card">
     <h2>Preferências</h2>
-    <form method="post">
+    <form method="post" id="parish-preferences">
       <input type="hidden" name="csrf" value="{{ csrf_token() }}">
       <fieldset>
         <legend>Formas disponíveis</legend>
@@ -64,4 +64,7 @@
     </table></div>
   {% else %}<p class="muted">As contribuições simuladas aparecem aqui.</p>{% endif %}
 </section>
+{% if webhook_enabled and donations | selectattr('sandbox_pix') | rejectattr('paid_at') | list %}
+  <script defer src="{{ url_for('static', filename='pix-status.js') }}" data-pix-version="{{ totals.count }}" data-edit-form="parish-preferences"></script>
+{% endif %}
 {% endblock %}

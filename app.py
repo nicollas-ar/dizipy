@@ -45,7 +45,18 @@ def parse_amount(value):
     return cents if cents > 0 else None
 
 
-def create_app(config=None):
+def matches_pix_payment(payment, donation):
+    value = payment.get("value")
+    return (
+        payment.get("id") == donation["payment_id"]
+        and payment.get("externalReference") == "dizipy-" + donation["id"]
+        and payment.get("billingType") == "PIX"
+        and type(value) in (int, float)
+        and Decimal(str(value)) * 100 == donation["amount"]
+    )
+
+
+def create_app(config=None, *, webhook_only=False):
     app = Flask(__name__)
     app.config.update(
         SECRET_KEY=os.environ.get("DIZIPY_SECRET_KEY") or secrets.token_hex(32),
@@ -55,10 +66,15 @@ def create_app(config=None):
         MAX_CONTENT_LENGTH=16_384,
         ASAAS_API_KEY=os.environ.get("ASAAS_API_KEY", "").strip(),
         ASAAS_CUSTOMER_ID=os.environ.get("ASAAS_CUSTOMER_ID", "").strip(),
+        ASAAS_WEBHOOK_TOKEN=os.environ.get("ASAAS_WEBHOOK_TOKEN", "").strip(),
     )
     if config:
         app.config.update(config)
     sandbox_enabled = bool(app.config["ASAAS_API_KEY"] and app.config["ASAAS_CUSTOMER_ID"])
+    webhook_token = app.config["ASAAS_WEBHOOK_TOKEN"]
+    if webhook_token and not re.fullmatch(r"\S{32,255}", webhook_token):
+        raise ValueError("ASAAS_WEBHOOK_TOKEN deve ter de 32 a 255 caracteres sem espaços.")
+    app.jinja_env.globals["webhook_enabled"] = bool(webhook_token)
     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
     app.add_template_filter(money, "money")
 
@@ -100,6 +116,10 @@ def create_app(config=None):
                 donation_id TEXT PRIMARY KEY REFERENCES donation(id),
                 payment_id TEXT UNIQUE
             );
+            CREATE TABLE IF NOT EXISTS asaas_webhook_event (
+                id TEXT PRIMARY KEY,
+                donation_id TEXT NOT NULL REFERENCES donation(id)
+            );
         """)
 
     @app.cli.command("asaas-cliente-teste")
@@ -130,7 +150,10 @@ def create_app(config=None):
 
     @app.before_request
     def check_csrf():
-        if request.method == "POST":
+        is_webhook = request.endpoint == "asaas_webhook"
+        if webhook_only and not is_webhook:
+            abort(404)
+        if request.method == "POST" and not is_webhook:
             provided = request.form.get("csrf", "")
             expected = session.get("csrf", "")
             if not expected or not hmac.compare_digest(provided.encode(), expected.encode()):
@@ -225,16 +248,22 @@ def create_app(config=None):
                 flash("Preferências salvas no modo de teste.")
             return redirect(url_for("dashboard"))
 
-        totals = db().execute("""
+        # O contador e a lista devem refletir o mesmo estado quando chega um webhook.
+        connection = db()
+        connection.execute("BEGIN")
+        totals = connection.execute("""
             SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS gross,
                    COALESCE(SUM(platform_fee), 0) AS fee
             FROM donation WHERE parish_id = ? AND paid_at IS NOT NULL
         """, (parish["id"],)).fetchone()
-        donations = db().execute("""
+        if request.args.get("pix_status") == "1":
+            return {"version": totals["count"]}
+        donations = connection.execute("""
             SELECT donation.*, asaas_pix.donation_id IS NOT NULL AS sandbox_pix
             FROM donation LEFT JOIN asaas_pix ON asaas_pix.donation_id = donation.id
             WHERE parish_id = ? ORDER BY created_at DESC LIMIT 20
         """, (parish["id"],)).fetchall()
+        connection.commit()
         return render_template("dashboard.html", parish=parish, totals=totals, donations=donations)
 
     @app.get("/painel/exportar")
@@ -307,18 +336,62 @@ def create_app(config=None):
         if not (owns_checkout or manages_sandbox_checkout):
             abort(404)
         if donation["sandbox_pix"]:
+            if request.method == "GET" and request.args.get("pix_status") == "1":
+                return {"version": int(donation["paid_at"] is not None)}
             return sandbox_payment(donation)
         if request.method == "POST":
-            mark_paid(donation_id)
+            with db() as connection:
+                mark_paid(connection, donation_id)
             return redirect(url_for("demo_payment", donation_id=donation_id))
         return render_template("payment.html", donation=donation)
 
-    def mark_paid(donation_id):
+    def mark_paid(connection, donation_id):
+        connection.execute(
+            "UPDATE donation SET paid_at = ? WHERE id = ? AND paid_at IS NULL",
+            (now().isoformat(), donation_id),
+        )
+
+    @app.post("/webhooks/asaas")
+    def asaas_webhook():
+        if not webhook_token:
+            abort(404)
+        provided = request.headers.get("asaas-access-token", "")
+        if not hmac.compare_digest(provided.encode(), webhook_token.encode()):
+            abort(401)
+
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or not isinstance(payload.get("event"), str):
+            abort(400)
+        if payload["event"] != "PAYMENT_RECEIVED":
+            return {"received": True}
+
+        event_id = payload.get("id")
+        payment = payload.get("payment")
+        if not isinstance(event_id, str) or not 1 <= len(event_id) <= 255 or not isinstance(payment, dict):
+            abort(400)
+        payment_id = payment.get("id")
+        if not isinstance(payment_id, str) or not payment_id:
+            abort(400)
+
         with db() as connection:
-            connection.execute(
-                "UPDATE donation SET paid_at = ? WHERE id = ? AND paid_at IS NULL",
-                (now().isoformat(), donation_id),
-            )
+            connection.execute("BEGIN IMMEDIATE")
+            if connection.execute("SELECT 1 FROM asaas_webhook_event WHERE id = ?", (event_id,)).fetchone():
+                return {"received": True}
+            donation = connection.execute("""
+                SELECT donation.id, donation.amount, asaas_pix.payment_id
+                FROM asaas_pix JOIN donation ON donation.id = asaas_pix.donation_id
+                WHERE asaas_pix.payment_id = ?
+            """, (payment_id,)).fetchone()
+            if donation is not None:
+                if payment.get("status") == "RECEIVED" and matches_pix_payment(payment, donation):
+                    mark_paid(connection, donation["id"])
+                    connection.execute(
+                        "INSERT INTO asaas_webhook_event (id, donation_id) VALUES (?, ?)",
+                        (event_id, donation["id"]),
+                    )
+                else:
+                    app.logger.warning("Webhook do Asaas ignorado: dados divergentes da contribuição.")
+        return {"received": True}
 
     def create_sandbox_charge(donation):
         reference = "dizipy-" + donation["id"]
@@ -366,14 +439,11 @@ def create_app(config=None):
                     if request.method == "POST":
                         if payment_id:
                             payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
-                            if (payment.get("id") != payment_id
-                                    or payment.get("externalReference") != "dizipy-" + donation["id"]
-                                    or payment.get("billingType") != "PIX"
-                                    or not isinstance(payment.get("value"), (int, float))
-                                    or Decimal(str(payment["value"])) * 100 != donation["amount"]):
+                            if not matches_pix_payment(payment, donation):
                                 raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
                             if payment.get("status") == "RECEIVED":
-                                mark_paid(donation["id"])
+                                with db() as connection:
+                                    mark_paid(connection, donation["id"])
                             else:
                                 flash("O Asaas ainda não registrou o recebimento da cobrança.")
                         else:
@@ -391,3 +461,8 @@ def create_app(config=None):
         return render_template("payment.html", donation=donation, qr=qr, sandbox_enabled=sandbox_enabled)
 
     return app
+
+
+def create_webhook_app():
+    """Mantém a interface local fora do túnel usado pelo Asaas."""
+    return create_app(webhook_only=True)
