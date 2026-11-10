@@ -47,7 +47,20 @@
   {% if donations %}
     <div class="scroll"><table>
       <thead><tr><th>Valor</th><th>Forma</th><th>Status</th></tr></thead>
-      <tbody>{% for row in donations %}<tr><td>{{ row.amount | money }}</td><td>{{ methods[row.method] }}{% if row.sandbox_pix %} · Asaas Sandbox{% endif %}</td><td>{{ ("Pago" if row.sandbox_pix else "Confirmado") if row.paid_at else "Pendente" }}</td></tr>{% endfor %}</tbody>
+      <tbody>
+        {% for row in donations %}
+          <tr>
+            <td>{{ row.amount | money }}</td>
+            <td>{{ methods[row.method] }}{% if row.sandbox_pix %} · Asaas Sandbox{% endif %}</td>
+            <td>
+              {{ ("Pago" if row.sandbox_pix else "Confirmado") if row.paid_at else "Pendente" }}
+              {% if row.sandbox_pix and not row.paid_at %}
+                <a href="{{ url_for('demo_payment', donation_id=row.id) }}">Retomar teste Pix</a>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
     </table></div>
   {% else %}<p class="muted">As contribuições simuladas aparecem aqui.</p>{% endif %}
 </section>

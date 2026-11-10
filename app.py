@@ -292,8 +292,6 @@ def create_app(config=None):
 
     @app.route("/simulacao/<donation_id>", methods=["GET", "POST"])
     def demo_payment(donation_id):
-        if session.get("demo_donation") != donation_id:
-            abort(404)
         donation = db().execute("""
             SELECT donation.*, parish.name AS parish_name,
                    asaas_pix.donation_id IS NOT NULL AS sandbox_pix, asaas_pix.payment_id
@@ -301,6 +299,12 @@ def create_app(config=None):
             LEFT JOIN asaas_pix ON asaas_pix.donation_id = donation.id WHERE donation.id = ?
         """, (donation_id,)).fetchone()
         if donation is None:
+            abort(404)
+        owns_checkout = session.get("demo_donation") == donation_id
+        manages_sandbox_checkout = (
+            donation["sandbox_pix"] and session.get("parish_id") == donation["parish_id"]
+        )
+        if not (owns_checkout or manages_sandbox_checkout):
             abort(404)
         if donation["sandbox_pix"]:
             return sandbox_payment(donation)
@@ -345,7 +349,7 @@ def create_app(config=None):
             if not isinstance(payment, dict) or payment.get("externalReference") != reference:
                 raise asaas.AsaasError("A referência da cobrança retornada pelo Asaas diverge da contribuição.")
             payment_id = payment.get("id")
-            if not isinstance(payment_id, str) or not re.fullmatch(r"pay_[A-Za-z0-9]+", payment_id):
+            if not isinstance(payment_id, str) or not re.fullmatch(r"pay_[A-Za-z0-9_]+", payment_id):
                 raise asaas.AsaasError("O Asaas Sandbox não devolveu um identificador de cobrança válido.")
             connection.execute(
                 "UPDATE asaas_pix SET payment_id = ? WHERE donation_id = ?", (payment_id, donation["id"]),
