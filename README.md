@@ -21,8 +21,27 @@ Abra http://127.0.0.1:5000. No Linux ou macOS, use `python3 -m venv .venv` e tro
 3. Cadastre uma paróquia fictícia, escaneie o QR Code com o celular na mesma rede, escolha o valor e simule a confirmação.
 4. Confira a contribuição no painel e exporte o CSV. No modo de teste, o valor líquido desconta só a taxa simulada da plataforma.
 
+## Testar Pix no Asaas Sandbox
+
+Na pasta do projeto, pare o Flask com `Ctrl+C` e atualize as dependências. Digite a chave do Sandbox somente quando o PowerShell pedir. Ela fica disponível aos processos iniciados nessa janela.
+
+```powershell
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+$env:ASAAS_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'Chave do Asaas Sandbox' -AsSecureString)).Password
+$env:ASAAS_CUSTOMER_ID = .\.venv\Scripts\python.exe -m flask --app app asaas-cliente-teste
+.\.venv\Scripts\python.exe -m flask --app app run --host 0.0.0.0
+```
+
+O comando `asaas-cliente-teste` cria um cadastro fictício no Sandbox com as notificações desabilitadas. Execute-o uma vez e guarde o identificador `cus_...` se quiser reutilizá-lo. Em outra sessão, defina `$env:ASAAS_CUSTOMER_ID = 'cus_...'` com o identificador guardado.
+
+1. Abra o link de contribuição no celular pela rede privada e escolha **Pix avulso · Asaas Sandbox**. Digite um valor de teste, como `10,00`, e clique em **Gerar Pix de teste**.
+2. No painel do Asaas Sandbox, abra a cobrança usando a referência `pay_...` mostrada no Dizipy e simule a confirmação do pagamento.
+3. No Dizipy, toque em **Consultar pagamento**. Quando a API indicar o recebimento, atualize o painel da paróquia para ver **Pago**. Os totais e o CSV passam a incluir essa contribuição, com a mesma taxa simulada do protótipo.
+
+A URL da API aponta apenas para o Sandbox. A consulta é manual para o teste na rede local. A confirmação automática por webhook fica para a próxima etapa. O Pix do Sandbox usa um cliente fictício compartilhado apenas neste ambiente de teste.
+
 ## Escopo desta versão
 
-O QR Code abre o simulador web. As quatro formas são opções de teste e geram apenas um comprovante simulado, inclusive quando o usuário escolhe um meio recorrente. O painel salva o dia e horário do lembrete, mas o envio ainda não está ligado.
+O QR Code abre o simulador web. Sem as variáveis do Asaas, as quatro formas usam o simulador local. Com o Sandbox configurado, só o Pix avulso usa a API do Asaas. O painel salva o dia e horário do lembrete, mas o envio ainda não está ligado.
 
-O próximo passo inclui conectar Meta, Asaas e IA, adicionar permissões por colaborador, ativação após verificação da conta de recebimento e execução dos lembretes com a regra de contato mensal. O piloto usa PostgreSQL no Neon e um workspace separado no Render. Esta versão local é exclusivamente para testes fictícios.
+O próximo passo inclui conectar Meta e IA, automatizar a confirmação do Asaas por webhook, adicionar permissões por colaborador, ativação após verificação da conta de recebimento e execução dos lembretes com a regra de contato mensal. O piloto usa PostgreSQL no Neon e um workspace separado no Render. Esta versão local é exclusivamente para testes fictícios.

@@ -4,7 +4,7 @@
 <section class="card narrow">
   <p class="eyebrow">Contribuição simulada</p>
   <h1>{{ parish.name }}</h1>
-  <p class="muted">Confira o nome da paróquia, escolha um valor e experimente a jornada. Nenhum valor será cobrado.</p>
+  <p class="muted">Escolha um valor para testar. Nenhum valor real será cobrado.</p>
   {% if enabled == [""] %}
     <p>Esta paróquia ainda precisa habilitar uma forma de pagamento.</p>
   {% else %}
@@ -12,7 +12,7 @@
       <input type="hidden" name="csrf" value="{{ csrf_token() }}">
       <label>Valor em reais<input name="amount" inputmode="decimal" placeholder="50,00" maxlength="9" required></label>
       <label>Forma de pagamento<select name="method" required>
-        {% for key, name in methods.items() %}{% if key in enabled %}<option value="{{ key }}">{{ name }}</option>{% endif %}{% endfor %}
+        {% for key, name in methods.items() %}{% if key in enabled %}<option value="{{ key }}">{{ name }}{% if sandbox_enabled and key == "pix" %} · Asaas Sandbox{% endif %}</option>{% endif %}{% endfor %}
       </select></label>
       <button>Revisar contribuição</button>
     </form>

@@ -2,10 +2,33 @@
 {% block title %}Confirmação · Dizipy{% endblock %}
 {% block content %}
 <section class="card narrow">
-  <p class="eyebrow">{{ "Comprovante simulado" if donation.paid_at else "Revise antes de confirmar" }}</p>
+  {% if donation.sandbox_pix %}
+    <p class="eyebrow">Pix · Asaas Sandbox</p>
+  {% else %}
+    <p class="eyebrow">{{ "Comprovante simulado" if donation.paid_at else "Revise antes de confirmar" }}</p>
+  {% endif %}
   <h1>{{ donation.amount | money }}</h1>
   <p>{{ donation.parish_name }} · {{ methods[donation.method] }}</p>
-  {% if donation.paid_at %}
+  {% if donation.sandbox_pix %}
+    {% if donation.paid_at %}
+      <p class="notice">Pago no Asaas Sandbox. Nenhum dinheiro real foi movimentado.</p>
+    {% else %}
+      <p class="muted">Cobrança de teste. Confirme o pagamento no painel do Asaas Sandbox.</p>
+      {% if donation.payment_id %}
+        <p>Pendente · {{ donation.payment_id }}</p>
+        {% if qr and qr.encodedImage and qr.payload %}
+          <img class="qr" width="180" height="180" src="data:image/png;base64,{{ qr.encodedImage }}" alt="QR Code Pix de teste">
+          <label>Pix Copia e Cola<input type="text" value="{{ qr.payload }}" readonly></label>
+        {% endif %}
+      {% endif %}
+      {% if sandbox_enabled %}
+        <form method="post">
+          <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+          <button>{{ "Consultar pagamento" if donation.payment_id else "Gerar Pix de teste" }}</button>
+        </form>
+      {% endif %}
+    {% endif %}
+  {% elif donation.paid_at %}
     <p class="notice">Contribuição simulada confirmada. Obrigado pela sua generosidade!</p>
     <p class="muted">Referência {{ donation.id }}</p>
   {% else %}

@@ -10,7 +10,10 @@ from io import BytesIO, StringIO
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import click
 import qrcode
+
+import asaas
 from flask import (
     Flask, Response, abort, flash, g, redirect, render_template, request,
     send_file, session, url_for,
@@ -50,15 +53,18 @@ def create_app(config=None):
         SESSION_COOKIE_HTTPONLY=True,
         SESSION_COOKIE_SAMESITE="Lax",
         MAX_CONTENT_LENGTH=16_384,
+        ASAAS_API_KEY=os.environ.get("ASAAS_API_KEY", "").strip(),
+        ASAAS_CUSTOMER_ID=os.environ.get("ASAAS_CUSTOMER_ID", "").strip(),
     )
     if config:
         app.config.update(config)
+    sandbox_enabled = bool(app.config["ASAAS_API_KEY"] and app.config["ASAAS_CUSTOMER_ID"])
     Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
     app.add_template_filter(money, "money")
 
     def db():
         if "db" not in g:
-            g.db = sqlite3.connect(app.config["DATABASE"])
+            g.db = sqlite3.connect(app.config["DATABASE"], timeout=15)
             g.db.row_factory = sqlite3.Row
             g.db.execute("PRAGMA foreign_keys = ON")
         return g.db
@@ -90,7 +96,29 @@ def create_app(config=None):
                 created_at TEXT NOT NULL,
                 paid_at TEXT
             );
+            CREATE TABLE IF NOT EXISTS asaas_pix (
+                donation_id TEXT PRIMARY KEY REFERENCES donation(id),
+                payment_id TEXT UNIQUE
+            );
         """)
+
+    @app.cli.command("asaas-cliente-teste")
+    def asaas_test_customer():
+        """Cria um cliente fictício no Sandbox e imprime seu identificador."""
+        if not app.config["ASAAS_API_KEY"]:
+            raise click.ClickException("Configure ASAAS_API_KEY antes de executar este comando.")
+        try:
+            customer = asaas.call(app.config["ASAAS_API_KEY"], "POST", "/customers", data={
+                "name": "Cliente Teste Dizipy",
+                "cpfCnpj": "24971563792",
+                "notificationDisabled": True,
+            })
+        except asaas.AsaasError as error:
+            raise click.ClickException(str(error)) from None
+        customer_id = customer.get("id")
+        if not isinstance(customer_id, str) or not re.fullmatch(r"cus_[A-Za-z0-9]+", customer_id):
+            raise click.ClickException("O Asaas Sandbox não devolveu um identificador de cliente válido.")
+        click.echo(customer_id)
 
     def csrf_token():
         if "csrf" not in session:
@@ -125,7 +153,7 @@ def create_app(config=None):
 
     @app.get("/health")
     def health():
-        return {"status": "ok", "mode": "demo"}
+        return {"status": "ok", "mode": "asaas_sandbox" if sandbox_enabled else "demo"}
 
     @app.get("/")
     def home():
@@ -203,7 +231,9 @@ def create_app(config=None):
             FROM donation WHERE parish_id = ? AND paid_at IS NOT NULL
         """, (parish["id"],)).fetchone()
         donations = db().execute("""
-            SELECT * FROM donation WHERE parish_id = ? ORDER BY created_at DESC LIMIT 20
+            SELECT donation.*, asaas_pix.donation_id IS NOT NULL AS sandbox_pix
+            FROM donation LEFT JOIN asaas_pix ON asaas_pix.donation_id = donation.id
+            WHERE parish_id = ? ORDER BY created_at DESC LIMIT 20
         """, (parish["id"],)).fetchall()
         return render_template("dashboard.html", parish=parish, totals=totals, donations=donations)
 
@@ -254,27 +284,106 @@ def create_app(config=None):
                         "INSERT INTO donation (id, parish_id, amount, platform_fee, method, created_at) VALUES (?, ?, ?, ?, ?, ?)",
                         (donation_id, parish["id"], amount, fee, method, now().isoformat()),
                     )
+                    if sandbox_enabled and method == "pix":
+                        connection.execute("INSERT INTO asaas_pix (donation_id) VALUES (?)", (donation_id,))
                 session["demo_donation"] = donation_id
                 return redirect(url_for("demo_payment", donation_id=donation_id))
-        return render_template("contribute.html", parish=parish, enabled=enabled)
+        return render_template("contribute.html", parish=parish, enabled=enabled, sandbox_enabled=sandbox_enabled)
 
     @app.route("/simulacao/<donation_id>", methods=["GET", "POST"])
     def demo_payment(donation_id):
         if session.get("demo_donation") != donation_id:
             abort(404)
         donation = db().execute("""
-            SELECT donation.*, parish.name AS parish_name
-            FROM donation JOIN parish ON parish.id = donation.parish_id WHERE donation.id = ?
+            SELECT donation.*, parish.name AS parish_name,
+                   asaas_pix.donation_id IS NOT NULL AS sandbox_pix, asaas_pix.payment_id
+            FROM donation JOIN parish ON parish.id = donation.parish_id
+            LEFT JOIN asaas_pix ON asaas_pix.donation_id = donation.id WHERE donation.id = ?
         """, (donation_id,)).fetchone()
         if donation is None:
             abort(404)
+        if donation["sandbox_pix"]:
+            return sandbox_payment(donation)
         if request.method == "POST":
-            with db() as connection:
-                connection.execute(
-                    "UPDATE donation SET paid_at = ? WHERE id = ? AND paid_at IS NULL",
-                    (now().isoformat(), donation_id),
-                )
+            mark_paid(donation_id)
             return redirect(url_for("demo_payment", donation_id=donation_id))
         return render_template("payment.html", donation=donation)
+
+    def mark_paid(donation_id):
+        with db() as connection:
+            connection.execute(
+                "UPDATE donation SET paid_at = ? WHERE id = ? AND paid_at IS NULL",
+                (now().isoformat(), donation_id),
+            )
+
+    def create_sandbox_charge(donation):
+        reference = "dizipy-" + donation["id"]
+        api_key = app.config["ASAAS_API_KEY"]
+        customer_id = app.config["ASAAS_CUSTOMER_ID"]
+        # Serializa tentativas de geração e recupera uma cobrança criada antes de uma falha local.
+        with db() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT payment_id FROM asaas_pix WHERE donation_id = ?", (donation["id"],),
+            ).fetchone()
+            if row["payment_id"]:
+                return
+            result = asaas.call(api_key, "GET", "/payments", params={
+                "externalReference": reference, "customer": customer_id, "limit": 2,
+            })
+            matches = result.get("data")
+            if not isinstance(matches, list) or len(matches) > 1:
+                raise asaas.AsaasError("Não foi possível identificar uma única cobrança no Sandbox.")
+            payment = matches[0] if matches else asaas.call(api_key, "POST", "/payments", data={
+                "customer": customer_id,
+                "billingType": "PIX",
+                "value": donation["amount"] / 100,
+                "dueDate": now().date().isoformat(),
+                "description": "Contribuição de teste Dizipy",
+                "externalReference": reference,
+            })
+            if not isinstance(payment, dict) or payment.get("externalReference") != reference:
+                raise asaas.AsaasError("A referência da cobrança retornada pelo Asaas diverge da contribuição.")
+            payment_id = payment.get("id")
+            if not isinstance(payment_id, str) or not re.fullmatch(r"pay_[A-Za-z0-9]+", payment_id):
+                raise asaas.AsaasError("O Asaas Sandbox não devolveu um identificador de cobrança válido.")
+            connection.execute(
+                "UPDATE asaas_pix SET payment_id = ? WHERE donation_id = ?", (payment_id, donation["id"]),
+            )
+
+    def sandbox_payment(donation):
+        qr = None
+        payment_id = donation["payment_id"]
+        if not donation["paid_at"]:
+            if not sandbox_enabled:
+                flash("Configure o Asaas Sandbox para continuar com esta cobrança.")
+            else:
+                try:
+                    if request.method == "POST":
+                        if payment_id:
+                            payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
+                            if (payment.get("id") != payment_id
+                                    or payment.get("externalReference") != "dizipy-" + donation["id"]
+                                    or payment.get("billingType") != "PIX"
+                                    or not isinstance(payment.get("value"), (int, float))
+                                    or Decimal(str(payment["value"])) * 100 != donation["amount"]):
+                                raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
+                            if payment.get("status") == "RECEIVED":
+                                mark_paid(donation["id"])
+                            else:
+                                flash("O Asaas ainda não registrou o recebimento da cobrança.")
+                        else:
+                            create_sandbox_charge(donation)
+                    elif payment_id:
+                        qr = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}/pixQrCode")
+                except asaas.AsaasError as error:
+                    flash(str(error))
+                except sqlite3.OperationalError as error:
+                    if "database is locked" not in str(error):
+                        raise
+                    flash("O Dizipy está finalizando outra tentativa. Tente novamente.")
+        if request.method == "POST":
+            return redirect(url_for("demo_payment", donation_id=donation["id"]))
+        return render_template("payment.html", donation=donation, qr=qr, sandbox_enabled=sandbox_enabled)
 
     return app
