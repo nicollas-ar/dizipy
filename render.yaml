@@ -22,3 +22,7 @@ services:
         generateValue: true
       - key: DIZIPY_ADMIN_EMAIL
         sync: false
+      - key: RESEND_API_KEY
+        sync: false
+      - key: DIZIPY_EMAIL_FROM
+        sync: false

@@ -1,0 +1,26 @@
+{% extends 'base.html' %}
+{% block title %}Revisão cadastral · Dizipy{% endblock %}
+{% block content %}
+<h1>Revisão de cadastros paroquiais</h1>
+<p>Consulte o CNPJ no portal da Receita Federal. Para aprovar, confira se a inscrição está ativa e se o cadastro ou a documentação da diocese vincula a entidade à paróquia.</p>
+<p><a href="https://solucoes.receita.fazenda.gov.br/Servicos/cnpjreva/" target="_blank" rel="noopener noreferrer">Consultar CNPJ na Receita Federal</a></p>
+{% set statuses = {'pending': 'Aguardando revisão', 'verified': 'Conferido', 'rejected': 'Pendente de correção'} %}
+{% for parish in parishes %}
+<section class="card spaced">
+  <h2>{{ parish.name }}</h2>
+  <p>{{ parish.cnpj }} · {{ statuses[parish.cnpj_status] }}</p>
+  {% if parish.cnpj_legal_name %}<p>Nome empresarial: {{ parish.cnpj_legal_name }}</p>{% endif %}
+  {% if parish.cnpj_status == 'pending' %}
+  <form method="post">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <input type="hidden" name="parish_id" value="{{ parish.id }}">
+    <input type="hidden" name="cnpj" value="{{ parish.cnpj }}">
+    <label>Nome empresarial no comprovante (para aprovar)<input name="legal_name" maxlength="200"></label>
+    <label><input type="checkbox" name="checked" required> Consultei o comprovante da Receita e conferi o vínculo com a paróquia.</label>
+    <button name="decision" value="verified">Aprovar cadastro</button>
+    <button name="decision" value="rejected" class="secondary">Solicitar correção</button>
+  </form>
+  {% endif %}
+</section>
+{% else %}<p>Nenhum CNPJ informado.</p>{% endfor %}
+{% endblock %}

@@ -85,3 +85,17 @@ td { vertical-align:top;font-size:.9rem; }
 th { color:var(--muted);font-weight:600;font-size:.8rem; }
 .inline-form { display:inline-block; }
 @media(max-width:750px) { .auth-layout { grid-template-columns:1fr;gap:18px;padding:0; } .intro { padding:10px 5px; } .feature-list { display:none; } .metrics,.settings { grid-template-columns:1fr; } .heading.top { align-items:flex-start;flex-direction:column; } .card { padding:20px; } header .top { gap:10px; } .badge { font-size:.75rem; } .filters { flex-wrap:wrap; } }
+
+.cookie-notice {
+  position: fixed;
+  inset: auto 1rem 1rem;
+  z-index: 10;
+  max-width: 45rem;
+  margin-inline: auto;
+  padding: 1rem;
+  background: #fff;
+  border: 1px solid #d9d3e9;
+  border-radius: 1rem;
+  box-shadow: 0 4px 24px #291b4830;
+}
+.cookie-notice p { margin: 0 0 .75rem; }

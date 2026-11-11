@@ -24,6 +24,7 @@ from werkzeug.security import check_password_hash, generate_password_hash
 import asaas
 from database import IntegrityError
 import messaging
+import verification
 import services
 from storage import audit, close_db, db, durable_secret, initialize, now, put_setting, secret_box, setting, stamp
 
@@ -35,6 +36,8 @@ def create_app(config=None, *, webhook_only=False):
     app=Flask(__name__)
     instance=Path(app.instance_path)
     app.config.update(DATABASE_URL=os.environ.get('DATABASE_URL',''),HOSTED=os.environ.get('DIZIPY_HOSTED')=='1',ADMIN_EMAIL=os.environ.get('DIZIPY_ADMIN_EMAIL','').strip().lower(),DATABASE=os.environ.get('DIZIPY_DATABASE') or instance/'dizipy.sqlite',SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',MAX_CONTENT_LENGTH=262144,ASAAS_CUSTOMER_ID=os.environ.get('ASAAS_CUSTOMER_ID',''),TESTING=False)
+    app.config.from_mapping(RESEND_API_KEY=os.environ.get('RESEND_API_KEY',''),
+                            DIZIPY_EMAIL_FROM=os.environ.get('DIZIPY_EMAIL_FROM',''))
     if config:
         app.config.update(config)
     if app.config['HOSTED']:
@@ -51,6 +54,9 @@ def create_app(config=None, *, webhook_only=False):
         data_dir.mkdir(parents=True,exist_ok=True)
         app.config.setdefault('LOCAL_ENCRYPTION_KEY',durable_secret(data_dir/'local.key',Fernet.generate_key()))
         app.config['SECRET_KEY']=app.config.get('SECRET_KEY') or os.environ.get('DIZIPY_SECRET_KEY') or durable_secret(data_dir/'session.key',secrets.token_bytes(32)).hex()
+    app.config['EMAIL_VERIFICATION'] = app.config['HOSTED'] or bool(app.config['RESEND_API_KEY'])
+    if app.config['EMAIL_VERIFICATION'] and not all(app.config[name] for name in ('RESEND_API_KEY','DIZIPY_EMAIL_FROM')):
+        raise RuntimeError('Configure RESEND_API_KEY e DIZIPY_EMAIL_FROM para enviar códigos de acesso.')
     app.extensions['secrets']=Fernet(app.config['LOCAL_ENCRYPTION_KEY'])
     app.teardown_appcontext(close_db)
     with app.app_context():
@@ -65,6 +71,8 @@ def create_app(config=None, *, webhook_only=False):
         return session['csrf']
 
     def current_user():
+        if app.config['EMAIL_VERIFICATION'] and session.get('email_verified') is not True:
+            return None
         if 'current_user' not in g:
             g.current_user=db().execute('SELECT * FROM app_user WHERE id=? AND active=1',(session.get('user_id'),)).fetchone()
         return g.current_user
@@ -141,6 +149,41 @@ def create_app(config=None, *, webhook_only=False):
     def home():
         return redirect(url_for('dashboard')) if current_user() else render_template('auth.html',register=False)
 
+    @app.get('/cookies')
+    def cookies():
+        return render_template('cookies.html')
+
+    def finish_password_step(user_id):
+        session.clear()
+        if not app.config['EMAIL_VERIFICATION']:
+            session['user_id']=user_id
+            return redirect(url_for('dashboard'))
+        user=db().execute('SELECT * FROM app_user WHERE id=? AND active=1',(user_id,)).fetchone()
+        if user is None:
+            return redirect(url_for('home'))
+        challenge=verification.issue_code(user)
+        if challenge is None:
+            flash('O envio do código não foi confirmado. Aguarde um minuto e tente entrar novamente.')
+            return redirect(url_for('home'))
+        session['email_challenge']=[user_id,challenge]
+        return redirect(url_for('verify_email'))
+
+    @app.route('/entrar/verificar',methods=['GET','POST'])
+    def verify_email():
+        pending=session.get('email_challenge')
+        if not pending:
+            return redirect(url_for('home'))
+        if request.method=='POST':
+            user_id,challenge=pending
+            user=db().execute('SELECT * FROM app_user WHERE id=? AND active=1',(user_id,)).fetchone()
+            if user and verification.verify_code(user,challenge,request.form.get('code','').strip()):
+                session.clear()
+                session['user_id']=user_id
+                session['email_verified']=True
+                return redirect(url_for('dashboard'))
+            flash('Código incorreto, expirado ou sem tentativas restantes. Se precisar de outro código, entre novamente.')
+        return render_template('verify_email.html')
+
     @app.route('/cadastro',methods=['GET','POST'])
     def register():
         if request.method=='POST':
@@ -151,6 +194,12 @@ def create_app(config=None, *, webhook_only=False):
             name=request.form.get('name','').strip()
             email=request.form.get('email','').strip().lower()
             password=request.form.get('password','')
+            raw_cnpj=request.form.get('cnpj','').strip()
+            try:
+                cnpj=verification.normalize_cnpj(raw_cnpj) if raw_cnpj or app.config['HOSTED'] else None
+            except ValueError as error:
+                flash(str(error))
+                return render_template('auth.html',register=True,hosted=app.config['HOSTED'])
             if not 2<=len(name)<=120 or not valid_email(email) or not 10<=len(password)<=128:
                 flash('Informe um nome, e-mail válido e senha de 10 a 128 caracteres.')
             else:
@@ -158,7 +207,7 @@ def create_app(config=None, *, webhook_only=False):
                     with db() as connection:
                         connection.execute('BEGIN IMMEDIATE')
                         password_hash=generate_password_hash(password)
-                        parish_id=connection.execute('INSERT INTO parish(public_id,name,email,password_hash,methods) VALUES(?,?,?,?,?)',(secrets.token_urlsafe(12),name,email,password_hash,','.join(METHODS))).lastrowid
+                        parish_id=connection.execute('INSERT INTO parish(public_id,name,email,password_hash,methods,cnpj) VALUES(?,?,?,?,?,?)',(secrets.token_urlsafe(12),name,email,password_hash,','.join(METHODS),cnpj)).lastrowid
                         first=not connection.execute('SELECT 1 FROM app_user').fetchone()
                         user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(first and (not app.config['HOSTED'] or email==app.config['ADMIN_EMAIL'])))).lastrowid
                         put_setting('asaas_webhook_token',secrets.token_hex(32),parish_id,secret=True)
@@ -166,9 +215,7 @@ def create_app(config=None, *, webhook_only=False):
                 except IntegrityError:
                     flash('Este e-mail já está cadastrado.')
                 else:
-                    session.clear()
-                    session['user_id']=user_id
-                    return redirect(url_for('dashboard'))
+                    return finish_password_step(user_id)
         return render_template('auth.html',register=True,hosted=app.config['HOSTED'])
 
     @app.post('/entrar')
@@ -183,9 +230,7 @@ def create_app(config=None, *, webhook_only=False):
         if user and len(password)<=128 and check_password_hash(user['password_hash'],password):
             with db():
                 db().execute('DELETE FROM login_attempt WHERE key=?',(key,))
-            session.clear()
-            session['user_id']=user['id']
-            return redirect(url_for('dashboard'))
+            return finish_password_step(user['id'])
         with db():
             failures=(attempt['failures'] if attempt else 0)+1
             db().execute('INSERT INTO login_attempt VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET failures=excluded.failures,blocked_until=excluded.blocked_until',(key,failures,time.time()+300 if failures>=8 else 0))
@@ -351,6 +396,52 @@ def create_app(config=None, *, webhook_only=False):
                 db().execute('UPDATE app_user SET password_hash=? WHERE id=?',(generate_password_hash(password),user_id))
             audit(target['parish_id'],'staff_updated',str(user_id),current_user()['id'])
         return redirect(url_for('staff'))
+
+    @app.route('/cadastro-paroquial',methods=['GET','POST'])
+    @require('owner')
+    def parish_registration():
+        parish=current_parish()
+        if request.method=='POST':
+            try:
+                cnpj=verification.normalize_cnpj(request.form.get('cnpj',''))
+            except ValueError as error:
+                flash(str(error))
+            else:
+                with db() as connection:
+                    connection.execute('BEGIN IMMEDIATE')
+                    connection.execute(
+                        "UPDATE parish SET cnpj=?,cnpj_status='pending',cnpj_legal_name=NULL,"
+                        "cnpj_reviewed_at=NULL WHERE id=? AND (cnpj IS NULL OR cnpj<>? OR cnpj_status='rejected')",
+                        (cnpj,parish['id'],cnpj))
+                flash('CNPJ salvo. Confira a situação cadastral abaixo.')
+            return redirect(url_for('parish_registration'))
+        return render_template('parish_registration.html',parish=parish)
+
+    @app.route('/plataforma/cadastros',methods=['GET','POST'])
+    @require()
+    def review_registrations():
+        local_admin()
+        if request.method=='POST':
+            parish_id=request.form.get('parish_id',type=int)
+            cnpj=request.form.get('cnpj','')
+            decision=request.form.get('decision')
+            legal_name=request.form.get('legal_name','').strip()
+            if decision not in ('verified','rejected') or request.form.get('checked')!='on':
+                abort(400)
+            if decision=='verified' and not 2<=len(legal_name)<=200:
+                abort(400,description='Informe o nome empresarial que consta no comprovante.')
+            with db() as connection:
+                connection.execute('BEGIN IMMEDIATE')
+                result=connection.execute(
+                    'UPDATE parish SET cnpj_status=?,cnpj_legal_name=?,cnpj_reviewed_at=? '
+                    "WHERE id=? AND cnpj=? AND cnpj_status='pending'",
+                    (decision,legal_name if decision=='verified' else None,stamp(),parish_id,cnpj))
+                if result.rowcount:
+                    audit(parish_id,'cnpj_reviewed',decision,current_user()['id'])
+            flash('Revisão registrada.' if result.rowcount else 'Cadastro alterado. Atualize a página e confira o CNPJ.')
+            return redirect(url_for('review_registrations'))
+        parishes=db().execute('SELECT * FROM parish WHERE cnpj IS NOT NULL ORDER BY name').fetchall()
+        return render_template('review_registrations.html',parishes=parishes)
 
     @app.route('/integracoes',methods=['GET','POST'])
     @require('owner')
