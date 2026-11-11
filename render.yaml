@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: dizipy-piloto
+    name: dizipy
     runtime: python
     branch: asaas-sandbox
     plan: free
@@ -25,4 +25,8 @@ services:
       - key: RESEND_API_KEY
         sync: false
       - key: DIZIPY_EMAIL_FROM
+        sync: false
+      - key: SERPRO_CONSUMER_KEY
+        sync: false
+      - key: SERPRO_CONSUMER_SECRET
         sync: false

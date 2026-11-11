@@ -125,7 +125,7 @@ def initialize():
     with connection:
         connection.execute('BEGIN IMMEDIATE')
         add_columns('parish', {'account_status':"TEXT NOT NULL DEFAULT 'demo'", 'account_id':'TEXT', 'reminder_enabled':'INTEGER NOT NULL DEFAULT 0', 'reminder_body':"TEXT NOT NULL DEFAULT 'Olá, {nome}! A {paroquia} agradece sua generosidade. Faça sua contribuição pelo link {link}. Para parar os lembretes, responda SAIR.'"})
-        add_columns('parish', {'cnpj':'TEXT', 'cnpj_status':"TEXT NOT NULL DEFAULT 'pending'", 'cnpj_legal_name':'TEXT', 'cnpj_reviewed_at':'TEXT'})
+        add_columns('parish', {'cnpj':'TEXT', 'cnpj_status':"TEXT NOT NULL DEFAULT 'pending'", 'cnpj_legal_name':'TEXT', 'cnpj_reviewed_at':'TEXT', 'cnpj_registry_status':'TEXT', 'cnpj_checked_at':'INTEGER'})
         add_columns('member', {'phone_verified_at':'TEXT'})
         add_columns('donation', {'member_id':'INTEGER REFERENCES member(id)', 'recurring_id':'TEXT REFERENCES recurring(id)', 'mode':"TEXT NOT NULL DEFAULT 'demo'", 'status':"TEXT NOT NULL DEFAULT 'pending'", 'settled_at':'TEXT', 'refunded_at':'TEXT', 'invoice_url':'TEXT', 'qr_payload':'TEXT', 'customer_id':'TEXT', 'period':'TEXT', 'remote_state':'TEXT', 'provider_fee':'INTEGER', 'split_applied':'INTEGER NOT NULL DEFAULT 0'})
         connection.execute("UPDATE donation SET mode='sandbox' WHERE id IN (SELECT donation_id FROM asaas_payment)")

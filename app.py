@@ -25,6 +25,7 @@ import asaas
 from database import IntegrityError
 import messaging
 import verification
+from cnpj_registry import Registry, RegistryUnavailable
 import services
 from storage import audit, close_db, db, durable_secret, initialize, now, put_setting, secret_box, setting, stamp
 
@@ -57,6 +58,12 @@ def create_app(config=None, *, webhook_only=False):
     app.config['EMAIL_VERIFICATION'] = app.config['HOSTED'] or bool(app.config['RESEND_API_KEY'])
     if app.config['EMAIL_VERIFICATION'] and not all(app.config[name] for name in ('RESEND_API_KEY','DIZIPY_EMAIL_FROM')):
         raise RuntimeError('Configure RESEND_API_KEY e DIZIPY_EMAIL_FROM para enviar códigos de acesso.')
+    if app.config['HOSTED']:
+        registry_key = os.environ.get('SERPRO_CONSUMER_KEY')
+        registry_secret = os.environ.get('SERPRO_CONSUMER_SECRET')
+        if not registry_key or not registry_secret:
+            raise RuntimeError('Configure SERPRO_CONSUMER_KEY e SERPRO_CONSUMER_SECRET.')
+        app.extensions['cnpj_registry'] = Registry(registry_key, registry_secret)
     app.extensions['secrets']=Fernet(app.config['LOCAL_ENCRYPTION_KEY'])
     app.teardown_appcontext(close_db)
     with app.app_context():
@@ -180,6 +187,10 @@ def create_app(config=None, *, webhook_only=False):
                 session.clear()
                 session['user_id']=user_id
                 session['email_verified']=True
+                parish = current_parish()
+                if app.config['HOSTED'] and user['role']=='owner' and parish['cnpj_status']!='verified':
+                    check_parish_cnpj(parish)
+                    return redirect(url_for('parish_registration'))
                 return redirect(url_for('dashboard'))
             flash('Código incorreto, expirado ou sem tentativas restantes. Se precisar de outro código, entre novamente.')
         return render_template('verify_email.html')
@@ -187,36 +198,49 @@ def create_app(config=None, *, webhook_only=False):
     @app.route('/cadastro',methods=['GET','POST'])
     def register():
         if request.method=='POST':
-            if app.config['HOSTED'] and (request.form.get('email','').strip().lower()!=app.config['ADMIN_EMAIL'] or db().execute('SELECT 1 FROM app_user WHERE email=?',(app.config['ADMIN_EMAIL'],)).fetchone()):
-                abort(403,description='O piloto está restrito à conta administradora.')
-            if app.config['HOSTED'] and request.form.get('email','').strip().lower()==app.config['ADMIN_EMAIL'] and not hmac.compare_digest(request.form.get('setup_token',''),os.environ.get('DIZIPY_SETUP_TOKEN','')):
-                abort(403,description='Confira o código de configuração inicial no Render.')
             name=request.form.get('name','').strip()
             email=request.form.get('email','').strip().lower()
+            if app.config['HOSTED'] and email==app.config['ADMIN_EMAIL']:
+                supplied=request.form.get('setup_token','').encode()
+                expected=os.environ['DIZIPY_SETUP_TOKEN'].encode()
+                if not hmac.compare_digest(supplied, expected):
+                    abort(403,description='Use o cadastro de administrador e o código inicial do Render.')
             password=request.form.get('password','')
             raw_cnpj=request.form.get('cnpj','').strip()
             try:
                 cnpj=verification.normalize_cnpj(raw_cnpj) if raw_cnpj or app.config['HOSTED'] else None
             except ValueError as error:
                 flash(str(error))
-                return render_template('auth.html',register=True,hosted=app.config['HOSTED'])
+                return render_template('auth.html',register=True,hosted=app.config['HOSTED'],admin_setup=request.args.get('administrador')=='1')
             if not 2<=len(name)<=120 or not valid_email(email) or not 10<=len(password)<=128:
                 flash('Informe um nome, e-mail válido e senha de 10 a 128 caracteres.')
             else:
                 try:
                     with db() as connection:
                         connection.execute('BEGIN IMMEDIATE')
+                        if app.config['HOSTED']:
+                            rate_key='signup:'+hashlib.sha256((request.remote_addr or '').encode()).hexdigest()
+                            rate=connection.execute('SELECT * FROM login_attempt WHERE key=?',(rate_key,)).fetchone()
+                            current=time.time()
+                            attempts=rate['failures'] if rate and rate['blocked_until']>current else 0
+                            if attempts>=5:
+                                abort(429,description='Limite de cadastros atingido. Tente novamente mais tarde.')
+                            until=rate['blocked_until'] if attempts else current+3600
+                            connection.execute(
+                                'INSERT INTO login_attempt VALUES(?,?,?) ON CONFLICT(key) DO UPDATE '
+                                'SET failures=excluded.failures,blocked_until=excluded.blocked_until',
+                                (rate_key,attempts+1,until))
                         password_hash=generate_password_hash(password)
                         parish_id=connection.execute('INSERT INTO parish(public_id,name,email,password_hash,methods,cnpj) VALUES(?,?,?,?,?,?)',(secrets.token_urlsafe(12),name,email,password_hash,','.join(METHODS),cnpj)).lastrowid
                         first=not connection.execute('SELECT 1 FROM app_user').fetchone()
-                        user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(first and (not app.config['HOSTED'] or email==app.config['ADMIN_EMAIL'])))).lastrowid
+                        user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(email==app.config['ADMIN_EMAIL'] if app.config['HOSTED'] else first))).lastrowid
                         put_setting('asaas_webhook_token',secrets.token_hex(32),parish_id,secret=True)
                         audit(parish_id,'parish_registered',user_id=user_id)
                 except IntegrityError:
                     flash('Este e-mail já está cadastrado.')
                 else:
                     return finish_password_step(user_id)
-        return render_template('auth.html',register=True,hosted=app.config['HOSTED'])
+        return render_template('auth.html',register=True,hosted=app.config['HOSTED'],admin_setup=request.args.get('administrador')=='1')
 
     @app.post('/entrar')
     def login():
@@ -397,6 +421,33 @@ def create_app(config=None, *, webhook_only=False):
             audit(target['parish_id'],'staff_updated',str(user_id),current_user()['id'])
         return redirect(url_for('staff'))
 
+    def check_parish_cnpj(parish):
+        registry=app.extensions.get('cnpj_registry')
+        if not registry or not parish['cnpj']:
+            return
+        cnpj=parish['cnpj']
+        now=int(time.time())
+        with db() as connection:
+            # Reserve the attempt before calling the paid API.
+            result=connection.execute(
+                'UPDATE parish SET cnpj_checked_at=? WHERE id=? AND cnpj=? '
+                "AND cnpj_status='pending' AND (cnpj_checked_at IS NULL OR "
+                "(cnpj_registry_status IS NULL AND cnpj_checked_at<=?) OR "
+                "(cnpj_registry_status IN ('inactive','not_found') AND cnpj_checked_at<=?))",
+                (now,parish['id'],cnpj,now-600,now-86400))
+            if not result.rowcount:
+                return
+        try:
+            status,name=registry.lookup(cnpj)
+        except RegistryUnavailable:
+            flash('A consulta de CNPJ está indisponível. Tente novamente em 10 minutos.')
+            return
+        with db() as connection:
+            connection.execute(
+                'UPDATE parish SET cnpj_registry_status=?,cnpj_legal_name=? '
+                "WHERE id=? AND cnpj=? AND cnpj_checked_at=? AND cnpj_status='pending'",
+                (status,name,parish['id'],cnpj,now))
+
     @app.route('/cadastro-paroquial',methods=['GET','POST'])
     @require('owner')
     def parish_registration():
@@ -411,8 +462,10 @@ def create_app(config=None, *, webhook_only=False):
                     connection.execute('BEGIN IMMEDIATE')
                     connection.execute(
                         "UPDATE parish SET cnpj=?,cnpj_status='pending',cnpj_legal_name=NULL,"
-                        "cnpj_reviewed_at=NULL WHERE id=? AND (cnpj IS NULL OR cnpj<>? OR cnpj_status='rejected')",
+                        "cnpj_reviewed_at=NULL,cnpj_registry_status=NULL WHERE id=? AND (cnpj IS NULL OR cnpj<>? OR cnpj_status='rejected')",
                         (cnpj,parish['id'],cnpj))
+                updated=current_parish()
+                check_parish_cnpj(updated)
                 flash('CNPJ salvo. Confira a situação cadastral abaixo.')
             return redirect(url_for('parish_registration'))
         return render_template('parish_registration.html',parish=parish)
@@ -432,6 +485,10 @@ def create_app(config=None, *, webhook_only=False):
                 abort(400,description='Informe o nome empresarial que consta no comprovante.')
             with db() as connection:
                 connection.execute('BEGIN IMMEDIATE')
+                if app.config['HOSTED'] and decision=='verified':
+                    record=connection.execute('SELECT cnpj_registry_status FROM parish WHERE id=? AND cnpj=?',(parish_id,cnpj)).fetchone()
+                    if not record or record['cnpj_registry_status']!='active':
+                        abort(400,description='A consulta ao Serpro precisa confirmar o CNPJ ativo.')
                 result=connection.execute(
                     'UPDATE parish SET cnpj_status=?,cnpj_legal_name=?,cnpj_reviewed_at=? '
                     "WHERE id=? AND cnpj=? AND cnpj_status='pending'",
@@ -613,6 +670,8 @@ def create_app(config=None, *, webhook_only=False):
     @app.route('/contribuir/<public_id>',methods=['GET','POST'])
     def contribute(public_id):
         parish=parish_by_public(public_id)
+        if app.config['HOSTED'] and parish['cnpj_status']!='verified':
+            abort(404,description='Esta página de contribuições ainda está em configuração.')
         token=request.args.get('pessoa') or session.get('member_tokens',{}).get(str(parish['id']))
         member=db().execute('SELECT * FROM member WHERE manage_token=? AND parish_id=?',(token,parish['id'])).fetchone() if token else None
         enabled=[method for method in parish['methods'].split(',') if method in METHODS]

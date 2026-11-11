@@ -6,7 +6,9 @@
   {% set statuses = {'pending': 'Aguardando revisão', 'verified': 'Conferido', 'rejected': 'Pendente de correção'} %}
   <p>Situação cadastral: {{ statuses[parish.cnpj_status] if parish.cnpj else 'CNPJ não informado' }}</p>
   {% if parish.cnpj_legal_name %}<p>Nome empresarial: {{ parish.cnpj_legal_name }}</p>{% endif %}
-  <p>Informe o CNPJ da entidade responsável pela paróquia. O cadastro será conferido com o comprovante da Receita Federal e o vínculo com a paróquia.</p>
+    {% set registry_statuses = {'active': 'Inscrição ativa', 'inactive': 'Inscrição sem situação ativa', 'not_found': 'Inscrição não localizada'} %}
+  {% if parish.cnpj %}<p>Consulta ao Serpro: {{ registry_statuses.get(parish.cnpj_registry_status, 'Aguardando consulta') }}</p>{% endif %}
+  <p>Informe o CNPJ da entidade responsável pela paróquia. A consulta confirma a situação cadastral. A equipe do Dizipy confere o vínculo com a igreja antes de liberar a página de contribuições.</p>
   <form method="post">
     <input type="hidden" name="csrf" value="{{ csrf_token() }}">
     <label>CNPJ<input name="cnpj" required maxlength="24" value="{{ parish.cnpj or '' }}" autocomplete="off"></label>

@@ -1,15 +1,16 @@
-# Colocar o piloto do Dizipy no ar
+# Hospedar o Dizipy
 
-O piloto começa com dados fictícios e pagamentos simulados. O site já pode receber HTTPS e webhooks pelo próprio Render, sem ngrok. Esta versão não movimenta dinheiro real.
+O cadastro de igrejas é público e consulta o CNPJ no Serpro depois de confirmar o e-mail do responsável. O Render fornece HTTPS para o site e os webhooks. A integração de pagamentos deste código usa Asaas Sandbox.
 
-## 1. Resend, Render e Neon
+## 1. Resend, Serpro, Render e Neon
 
-Crie uma conta no [Resend](https://resend.com/) e gere uma chave com permissão de envio. Para testar com o próprio e-mail da conta Resend, use `onboarding@resend.dev` e use o mesmo e-mail em `DIZIPY_ADMIN_EMAIL`. Para enviar códigos a colaboradores com outros e-mails, verifique um domínio seu no Resend e use um remetente desse domínio.
+Contrate a [Consulta CNPJ básica do Serpro](https://apicenter.estaleiro.serpro.gov.br/documentacao/consulta-cnpj/) para obter Consumer Key e Consumer Secret de produção. Crie uma conta no [Resend](https://resend.com/) e gere uma chave com permissão de envio. Para testar com o próprio e-mail da conta Resend, use `onboarding@resend.dev` e use o mesmo e-mail em `DIZIPY_ADMIN_EMAIL`. Para enviar códigos a colaboradores com outros e-mails, verifique um domínio seu no Resend e use um remetente desse domínio.
 
 | Variável no Render | Valor |
 | --- | --- |
 | `DATABASE_URL` | URL PostgreSQL completa do Neon, com TLS |
 | `DIZIPY_ADMIN_EMAIL` | E-mail que criará a conta administradora |
+| `SERPRO_CONSUMER_KEY` e `SERPRO_CONSUMER_SECRET` | Credenciais de produção da Consulta CNPJ básica |
 | `RESEND_API_KEY` | Chave de envio do Resend |
 | `DIZIPY_EMAIL_FROM` | Remetente de teste do Resend ou endereço de domínio verificado |
 | `DIZIPY_HOSTED` | `1`, configurado pelo Blueprint |
@@ -20,16 +21,16 @@ Crie uma conta no [Resend](https://resend.com/) e gere uma chave com permissão 
 Cole os segredos diretamente no Render. O Asaas e a Meta são configurados dentro do Dizipy, nos passos abaixo. O modo local com SQLite continua disponível. Para testar e-mail localmente, forneça as duas variáveis do Resend antes de abrir o app.
 
 1. No [Neon](https://console.neon.tech/), selecione um banco **vazio e exclusivo do Dizipy**. Não reutilize o banco do site da paróquia. Abra **Connect** e copie a URL completa que começa com `postgresql://`, mantendo os parâmetros TLS.
-2. No [Render](https://dashboard.render.com/), abra **New → Blueprint**. Selecione `nicollas-ar/dizipy`, branch `asaas-sandbox`, e o arquivo `render.yaml`. A configuração cria um serviço web de piloto no plano Free, sem criar um banco ou tarefa paga no Render.
-3. Preencha `DATABASE_URL` com a URL do Neon e `DIZIPY_ADMIN_EMAIL` com seu e-mail. Preencha também as duas variáveis do Resend da tabela. O Blueprint gera as três chaves de sessão, criptografia e cadastro. Mantenha essas chaves no Render, especialmente `DIZIPY_ENCRYPTION_KEY`: perder ou mudar essa chave torna as configurações cifradas ilegíveis.
-4. Depois de o serviço ficar **Live**, abra seu endereço `https://…onrender.com/health`. Deve retornar `status: ok`. Abra `/cadastro` e cadastre a paróquia com o CNPJ da entidade responsável, o mesmo e-mail e o valor de `DIZIPY_SETUP_TOKEN` da aba **Environment**. Esse cadastro só funciona uma vez. Confirme o código que chegar por e-mail. A confirmação é exigida a cada novo login na hospedagem.
+2. No [Render](https://dashboard.render.com/), abra **New → Blueprint**. Selecione `nicollas-ar/dizipy`, branch `asaas-sandbox`, e o arquivo `render.yaml`. A configuração cria um serviço web no plano Free, sem criar um banco ou tarefa paga no Render.
+3. Preencha `DATABASE_URL` com a URL do Neon e `DIZIPY_ADMIN_EMAIL` com seu e-mail. Preencha também as variáveis do Resend e do Serpro da tabela. O Blueprint gera as três chaves de sessão, criptografia e cadastro. Mantenha essas chaves no Render, especialmente `DIZIPY_ENCRYPTION_KEY`: perder ou mudar essa chave torna as configurações cifradas ilegíveis.
+4. Depois de o serviço ficar **Live**, abra seu endereço `https://…onrender.com/health`. Deve retornar `status: ok`. Abra `/cadastro?administrador=1` e cadastre a paróquia com o CNPJ da entidade responsável, o mesmo e-mail e o valor de `DIZIPY_SETUP_TOKEN` da aba **Environment**. O código inicial é exclusivo do cadastro da plataforma. Outras igrejas usam `/cadastro` com o e-mail do responsável, senha e CNPJ. Confirme o código que chegar por e-mail. A confirmação é exigida a cada novo login na hospedagem.
 5. No Dizipy, abra **Plataforma** e confira o endereço público HTTPS. Deixe o endereço separado do receptor vazio: no Render, painel e webhooks usam o mesmo domínio. Confira uma contribuição em demonstração antes de mudar para o Sandbox.
 
 Se preferir usar um Web Service do Dizipy já criado, selecione a mesma branch. Use `pip install -r requirements.txt` no build e `gunicorn wsgi:app --bind 0.0.0.0:$PORT --workers 1 --threads 4 --timeout 120` na inicialização. Copie as variáveis listadas no Blueprint, gere valores aleatórios fortes para as três chaves e configure `/health` como caminho de verificação. Não altere outro site da paróquia.
 
 ## Conferir o cadastro da paróquia
 
-No Dizipy, abra **Revisão cadastral**. Consulte o comprovante no [portal da Receita Federal](https://solucoes.receita.fazenda.gov.br/Servicos/cnpjreva/) e confira o nome empresarial, a situação ativa e o vínculo com a paróquia. Se o CNPJ for da mitra ou da diocese, confirme com a secretaria que aquela é a entidade responsável. Registre o resultado no painel. Essa consulta manual dispensa outra conta de API. O fluxo Sandbox continua disponível para testes enquanto o cadastro é conferido.
+No Dizipy, abra **Revisão cadastral**. Consulte o comprovante no [portal da Receita Federal](https://solucoes.receita.fazenda.gov.br/Servicos/cnpjreva/) e confira o nome empresarial, a situação ativa e o vínculo com a paróquia. Se o CNPJ for da mitra ou da diocese, confirme com a secretaria que aquela é a entidade responsável. O Serpro precisa confirmar a inscrição ativa. Registre também a revisão do vínculo e da autorização do responsável no painel. A página de contribuições fica indisponível enquanto o cadastro está em revisão.
 
 ## 2. Asaas Sandbox
 
