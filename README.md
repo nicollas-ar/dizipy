@@ -2,6 +2,8 @@
 
 Painel para paróquias, fiéis, contribuições e lembretes. Esta versão permite testar a experiência inteira em demonstração, sem ngrok e sem movimentar dinheiro. Ainda não é a versão homologada para uso real pela paróquia.
 
+Para hospedar a versão de piloto com Render e Neon, veja [Colocar o piloto no ar](DEPLOY.md).
+
 ## Abrir no Windows
 
 1. Encerre as janelas antigas do Flask antes de atualizar. Faça uma cópia da pasta `instance` se já tiver dados de teste importantes.

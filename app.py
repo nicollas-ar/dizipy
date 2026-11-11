@@ -1,4 +1,5 @@
 """Dizipy local. Execute iniciar.bat para abrir a aplicação e a agenda."""
+import base64
 import csv
 import hashlib
 import hmac
@@ -21,6 +22,7 @@ from flask import Flask, Response, abort, flash, g, redirect, render_template, r
 from werkzeug.security import check_password_hash, generate_password_hash
 
 import asaas
+from database import IntegrityError
 import messaging
 import services
 from storage import audit, close_db, db, durable_secret, initialize, now, put_setting, secret_box, setting, stamp
@@ -32,13 +34,23 @@ PERMISSIONS={'finance':'Consultar e exportar contribuições','people':'Gerencia
 def create_app(config=None, *, webhook_only=False):
     app=Flask(__name__)
     instance=Path(app.instance_path)
-    app.config.update(DATABASE=os.environ.get('DIZIPY_DATABASE') or instance/'dizipy.sqlite',SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',MAX_CONTENT_LENGTH=262144,ASAAS_CUSTOMER_ID=os.environ.get('ASAAS_CUSTOMER_ID',''),TESTING=False)
+    app.config.update(DATABASE_URL=os.environ.get('DATABASE_URL',''),HOSTED=os.environ.get('DIZIPY_HOSTED')=='1',ADMIN_EMAIL=os.environ.get('DIZIPY_ADMIN_EMAIL','').strip().lower(),DATABASE=os.environ.get('DIZIPY_DATABASE') or instance/'dizipy.sqlite',SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',MAX_CONTENT_LENGTH=262144,ASAAS_CUSTOMER_ID=os.environ.get('ASAAS_CUSTOMER_ID',''),TESTING=False)
     if config:
         app.config.update(config)
-    data_dir=Path(app.config['DATABASE']).parent
-    data_dir.mkdir(parents=True,exist_ok=True)
-    app.config.setdefault('LOCAL_ENCRYPTION_KEY',durable_secret(data_dir/'local.key',Fernet.generate_key()))
-    app.config['SECRET_KEY']=app.config.get('SECRET_KEY') or os.environ.get('DIZIPY_SECRET_KEY') or durable_secret(data_dir/'session.key',secrets.token_bytes(32)).hex()
+    if app.config['HOSTED']:
+        required = ('DATABASE_URL','DIZIPY_ENCRYPTION_KEY','DIZIPY_SECRET_KEY','DIZIPY_ADMIN_EMAIL','DIZIPY_SETUP_TOKEN')
+        if any(not os.environ.get(name) for name in required):
+            raise RuntimeError('Configure as variáveis de banco, chaves e cadastro inicial do render.yaml.')
+        app.config['LOCAL_ENCRYPTION_KEY']=base64.urlsafe_b64encode(hashlib.sha256(os.environ['DIZIPY_ENCRYPTION_KEY'].encode()).digest())
+        app.config['SECRET_KEY']=os.environ['DIZIPY_SECRET_KEY']
+        app.config['SESSION_COOKIE_SECURE']=True
+        from werkzeug.middleware.proxy_fix import ProxyFix
+        app.wsgi_app=ProxyFix(app.wsgi_app,x_for=1,x_proto=1,x_host=1)
+    else:
+        data_dir=Path(app.config['DATABASE']).parent
+        data_dir.mkdir(parents=True,exist_ok=True)
+        app.config.setdefault('LOCAL_ENCRYPTION_KEY',durable_secret(data_dir/'local.key',Fernet.generate_key()))
+        app.config['SECRET_KEY']=app.config.get('SECRET_KEY') or os.environ.get('DIZIPY_SECRET_KEY') or durable_secret(data_dir/'session.key',secrets.token_bytes(32)).hex()
     app.extensions['secrets']=Fernet(app.config['LOCAL_ENCRYPTION_KEY'])
     app.teardown_appcontext(close_db)
     with app.app_context():
@@ -132,6 +144,10 @@ def create_app(config=None, *, webhook_only=False):
     @app.route('/cadastro',methods=['GET','POST'])
     def register():
         if request.method=='POST':
+            if app.config['HOSTED'] and (request.form.get('email','').strip().lower()!=app.config['ADMIN_EMAIL'] or db().execute('SELECT 1 FROM app_user WHERE email=?',(app.config['ADMIN_EMAIL'],)).fetchone()):
+                abort(403,description='O piloto está restrito à conta administradora.')
+            if app.config['HOSTED'] and request.form.get('email','').strip().lower()==app.config['ADMIN_EMAIL'] and not hmac.compare_digest(request.form.get('setup_token',''),os.environ.get('DIZIPY_SETUP_TOKEN','')):
+                abort(403,description='Confira o código de configuração inicial no Render.')
             name=request.form.get('name','').strip()
             email=request.form.get('email','').strip().lower()
             password=request.form.get('password','')
@@ -144,16 +160,16 @@ def create_app(config=None, *, webhook_only=False):
                         password_hash=generate_password_hash(password)
                         parish_id=connection.execute('INSERT INTO parish(public_id,name,email,password_hash,methods) VALUES(?,?,?,?,?)',(secrets.token_urlsafe(12),name,email,password_hash,','.join(METHODS))).lastrowid
                         first=not connection.execute('SELECT 1 FROM app_user').fetchone()
-                        user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(first))).lastrowid
+                        user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(first and (not app.config['HOSTED'] or email==app.config['ADMIN_EMAIL'])))).lastrowid
                         put_setting('asaas_webhook_token',secrets.token_hex(32),parish_id,secret=True)
                         audit(parish_id,'parish_registered',user_id=user_id)
-                except sqlite3.IntegrityError:
+                except IntegrityError:
                     flash('Este e-mail já está cadastrado.')
                 else:
                     session.clear()
                     session['user_id']=user_id
                     return redirect(url_for('dashboard'))
-        return render_template('auth.html',register=True)
+        return render_template('auth.html',register=True,hosted=app.config['HOSTED'])
 
     @app.post('/entrar')
     def login():
@@ -311,7 +327,7 @@ def create_app(config=None, *, webhook_only=False):
                         db().execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,permissions) VALUES(?,?,?,?,'staff',?)",(parish['id'],name,email,generate_password_hash(password),json.dumps(sorted(permissions))))
                         audit(parish['id'],'staff_created',email,current_user()['id'])
                     flash('Colaborador cadastrado.')
-                except sqlite3.IntegrityError:
+                except IntegrityError:
                     flash('Esse e-mail já está em uso.')
             return redirect(url_for('staff'))
         users=db().execute("SELECT * FROM app_user WHERE parish_id=? AND role='staff' ORDER BY name",(parish['id'],)).fetchall()
@@ -399,13 +415,16 @@ def create_app(config=None, *, webhook_only=False):
         keys=('public_url','webhook_url','whatsapp_phone_id','whatsapp_version','whatsapp_template','whatsapp_language','whatsapp_number','platform_wallet')
         settings={name:setting(name) for name in keys}
         checks={'asaas':bool(setting('asaas_key')),'whatsapp':bool(setting('whatsapp_token')),'public':bool(setting('public_url'))}
-        return render_template('platform.html',settings=settings,checks=checks,verify_token=setting('whatsapp_verify_token'))
+        return render_template('platform.html',hosted=app.config['HOSTED'],settings=settings,checks=checks,verify_token=setting('whatsapp_verify_token'))
 
     @app.get('/plataforma/backup')
     @require()
     def backup():
         local_admin()
         # O arquivo inclui todas as paróquias. Só o administrador da plataforma tem acesso.
+        if app.config.get('DATABASE_URL'):
+            flash('O banco está no Neon. Use a recuperação e exportação do projeto no painel Neon. Guarde também as chaves do ambiente Render.')
+            return redirect(url_for('platform'))
         import tempfile
         import zipfile
         with tempfile.TemporaryDirectory() as folder:
@@ -534,7 +553,7 @@ def create_app(config=None, *, webhook_only=False):
                     session['member_tokens']=tokens
                     session['demo_donation']=donation_id
                     return redirect(url_for('demo_payment',donation_id=donation_id))
-                except sqlite3.IntegrityError:
+                except IntegrityError:
                     flash('Este cadastro já foi utilizado. Volte ao seu link pessoal ou tente novamente.')
                 except ValueError as error:
                     flash(str(error))

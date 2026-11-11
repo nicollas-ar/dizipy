@@ -77,7 +77,7 @@ class Workflows(unittest.TestCase):
         retained=restarted.test_client()
         retained.set_cookie('session',self.owner.get_cookie('session').value)
         self.assertEqual(retained.get('/painel').status_code,200)
-        self.assertEqual(self.owner.get('/plataforma/backup').status_code,200)
+        self.assertEqual(self.owner.get('/plataforma/backup').status_code,302 if self.app.config.get('DATABASE_URL') else 200)
 
     def test_staff_permissions_tenant_isolation_and_csrf(self):
         self.owner.get('/colaboradores')
