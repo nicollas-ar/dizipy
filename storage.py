@@ -124,17 +124,19 @@ def initialize():
         connection.executescript(schema)
     with connection:
         connection.execute('BEGIN IMMEDIATE')
-        add_columns('parish', {'account_status':"TEXT NOT NULL DEFAULT 'demo'", 'account_id':'TEXT', 'reminder_enabled':'INTEGER NOT NULL DEFAULT 0', 'reminder_body':"TEXT NOT NULL DEFAULT 'Olá, {nome}! A {paroquia} agradece sua generosidade. Faça sua contribuição pelo link {link}. Para parar os lembretes, responda SAIR.'"})
+        add_columns('parish', {'account_status':"TEXT NOT NULL DEFAULT 'demo'", 'account_id':'TEXT', 'live_account_id':'TEXT', 'live_account_cnpj':'TEXT', 'live_account_status':"TEXT NOT NULL DEFAULT 'PENDING'", 'reminder_enabled':'INTEGER NOT NULL DEFAULT 0', 'reminder_body':"TEXT NOT NULL DEFAULT 'Olá, {nome}! A {paroquia} agradece sua generosidade. Faça sua contribuição pelo link {link}. Para parar os lembretes, responda SAIR.'"})
         add_columns('parish', {'cnpj':'TEXT', 'cnpj_status':"TEXT NOT NULL DEFAULT 'pending'", 'cnpj_legal_name':'TEXT', 'cnpj_reviewed_at':'TEXT', 'cnpj_registry_status':'TEXT', 'cnpj_checked_at':'INTEGER'})
         add_columns('member', {'phone_verified_at':'TEXT'})
         add_columns('donation', {'member_id':'INTEGER REFERENCES member(id)', 'recurring_id':'TEXT REFERENCES recurring(id)', 'mode':"TEXT NOT NULL DEFAULT 'demo'", 'status':"TEXT NOT NULL DEFAULT 'pending'", 'settled_at':'TEXT', 'refunded_at':'TEXT', 'invoice_url':'TEXT', 'qr_payload':'TEXT', 'customer_id':'TEXT', 'period':'TEXT', 'remote_state':'TEXT', 'provider_fee':'INTEGER', 'split_applied':'INTEGER NOT NULL DEFAULT 0'})
-        connection.execute("UPDATE donation SET mode='sandbox' WHERE id IN (SELECT donation_id FROM asaas_payment)")
+        connection.execute("UPDATE donation SET mode='sandbox' WHERE mode='demo' AND id IN (SELECT donation_id FROM asaas_payment)")
         connection.execute("UPDATE donation SET status='paid' WHERE paid_at IS NOT NULL AND status='pending'")
         connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS member_phone ON member(parish_id,phone) WHERE phone!=""')
         connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS recurring_period ON donation(recurring_id,period) WHERE recurring_id IS NOT NULL')
         connection.execute('CREATE UNIQUE INDEX IF NOT EXISTS provider_recurring ON recurring(parish_id,provider_subscription) WHERE provider_subscription IS NOT NULL')
         for parish in connection.execute('SELECT * FROM parish').fetchall():
             connection.execute("INSERT OR IGNORE INTO app_user(parish_id,name,email,password_hash,role) VALUES(?,?,?,?, 'owner')", (parish['id'],parish['name'],parish['email'],parish['password_hash']))
+            if current_app.config['HOSTED'] and not setting('asaas_live_webhook_token',parish_id=parish['id']):
+                put_setting('asaas_live_webhook_token',secrets.token_hex(32),parish['id'],secret=True)
             if not setting('asaas_webhook_token',parish_id=parish['id']):
                 put_setting('asaas_webhook_token',secrets.token_hex(32),parish['id'],secret=True)
         if not connection.execute('SELECT 1 FROM app_user WHERE platform_admin=1').fetchone():

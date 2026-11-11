@@ -1,0 +1,25 @@
+{% extends 'base.html' %}
+{% block title %}Conta recebedora · Dizipy{% endblock %}
+{% block content %}
+<h1>Conta recebedora</h1>
+<section class="card">
+  <h2>Asaas</h2>
+  <p>Use uma conta de produção aprovada no mesmo CNPJ da igreja. As contribuições são recebidas nessa conta.</p>
+  <p>Situação: {{ parish.live_account_status|label }}</p>
+  <form method="post">
+    <input type="hidden" name="csrf" value="{{ csrf_token() }}">
+    <label>Chave da API de produção
+      <input type="password" name="asaas_key" autocomplete="new-password" {% if not has_key %}required{% endif %}>
+    </label>
+    <button>{{ 'Verificar ou atualizar chave' if has_key else 'Vincular conta' }}</button>
+  </form>
+</section>
+{% if has_key %}
+<section class="card spaced">
+  <h2>Confirmação automática de pagamentos</h2>
+  <p>Cadastre o webhook abaixo no painel do Asaas. Ative eventos de pagamentos, assinaturas, autorizações do Pix Automático e situação cadastral.</p>
+  <label>URL do webhook<input readonly value="{{ provider_url(hook_path) }}"></label>
+  <label>Token de autenticação<input readonly value="{{ hook_token }}"></label>
+</section>
+{% endif %}
+{% endblock %}

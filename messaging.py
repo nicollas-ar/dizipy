@@ -1,3 +1,4 @@
+from flask import current_app
 """Agenda mensal e envio pelo número empresarial central do Dizipy."""
 import calendar
 import hashlib
@@ -7,7 +8,7 @@ import unicodedata
 
 import requests
 from storage import db, now, setting, stamp
-from services import public_url
+from services import public_url, live_ready
 
 
 def normalize_phone(value):
@@ -39,8 +40,10 @@ def enqueue_reminders(today=None,force_parish=None):
             members=connection.execute('SELECT * FROM member WHERE parish_id=? AND active=1 AND consent_at IS NOT NULL AND opted_out_at IS NULL AND phone!=""',(parish['id'],)).fetchall()
             for member in members:
                 mode=setting('whatsapp_mode','demo')
-                if mode=='cloud' and (not member['phone_verified_at'] or parish['account_status']!='APPROVED'):
-                    continue
+                if mode=='cloud':
+                    ready=live_ready(parish) if current_app.config['HOSTED'] else parish['account_status']=='APPROVED'
+                    if not member['phone_verified_at'] or not ready:
+                        continue
                 result=connection.execute('INSERT OR IGNORE INTO message(parish_id,member_id,period,body,phone,mode,created_at) VALUES(?,?,?,?,?,?,?)',(parish['id'],member['id'],period,reminder_text(parish,member),member['phone'],mode,stamp()))
                 created+=result.rowcount
     return created

@@ -40,6 +40,8 @@ def next_month(value, day):
 
 
 def api_key(parish_id):
+    if current_app.config['HOSTED']:
+        return setting('asaas_live_key', parish_id=parish_id)
     direct=setting('asaas_key', parish_id=parish_id)
     first=db().execute('SELECT MIN(id) FROM parish').fetchone()[0]
     return direct or (setting('asaas_key') if parish_id==first else '')
@@ -48,7 +50,9 @@ def api_key(parish_id):
 def api(parish_id, method, path, **kwargs):
     key = api_key(parish_id)
     if not key:
-        raise asaas.AsaasError('Configure a conta de testes do Asaas em Integrações.')
+        raise asaas.AsaasError('Configure a conta recebedora do Asaas em Integrações.')
+    if current_app.config['HOSTED']:
+        return asaas.call(key, method, path, production=True, **kwargs)
     return asaas.call(key, method, path, **kwargs)
 
 
@@ -67,7 +71,8 @@ def invoice_url(value):
         parsed = urlsplit(value)
     except ValueError:
         return ''
-    return value if parsed.scheme == 'https' and parsed.netloc in ('sandbox.asaas.com','sandbox.asaas.com:443') else ''
+    hosts = ('asaas.com', 'www.asaas.com') if current_app.config['HOSTED'] else ('sandbox.asaas.com',)
+    return value if parsed.scheme == 'https' and parsed.netloc in hosts else ''
 
 
 def public_url(path):
@@ -76,13 +81,24 @@ def public_url(path):
 
 
 def mode_for_new():
-    return setting('mode', 'demo')
+    return 'production' if current_app.config['HOSTED'] else setting('mode', 'demo')
+
+
+def check_payment_environment(mode):
+    if (mode == 'production') != current_app.config['HOSTED']:
+        raise asaas.AsaasError('Esta cobrança pertence a outro ambiente do Asaas.')
+
+
+def live_ready(parish):
+    return (parish['cnpj_status']=='verified' and parish['live_account_status']=='APPROVED'
+            and bool(parish['live_account_id']) and parish['live_account_cnpj']==parish['cnpj'])
 
 
 def new_donation(parish_id, amount, method, member_id=None, recurring_id=None, period=None, mode=None):
     donation_id = secrets.token_urlsafe(18)
     mode = mode or mode_for_new()
-    db().execute('INSERT INTO donation(id,parish_id,amount,platform_fee,method,created_at,member_id,recurring_id,mode,period) VALUES(?,?,?,?,?,?,?,?,?,?)', (donation_id,parish_id,amount,fee(amount),method,stamp(),member_id,recurring_id,mode,period))
+    platform_fee = 0 if mode=='production' else fee(amount)
+    db().execute('INSERT INTO donation(id,parish_id,amount,platform_fee,method,created_at,member_id,recurring_id,mode,period) VALUES(?,?,?,?,?,?,?,?,?,?)', (donation_id,parish_id,amount,platform_fee,method,stamp(),member_id,recurring_id,mode,period))
     return donation_id
 
 
@@ -93,13 +109,17 @@ def customer_for(donation):
         if legacy:
             return legacy
         raise asaas.AsaasError('Cadastre os dados do contribuinte para criar a cobrança de teste.')
-    account_hash = hashlib.sha256(api_key(donation['parish_id']).encode()).hexdigest()
+    if donation['mode']=='production':
+        account = db().execute('SELECT live_account_id FROM parish WHERE id=?',(donation['parish_id'],)).fetchone()
+        account_hash = hashlib.sha256(('production:'+account['live_account_id']).encode()).hexdigest()
+    else:
+        account_hash = hashlib.sha256(api_key(donation['parish_id']).encode()).hexdigest()
     saved = db().execute('SELECT provider_id FROM customer WHERE member_id=? AND account_hash=?', (member['id'],account_hash)).fetchone()
     if saved:
         return saved['provider_id']
     document = current_app.extensions['secrets'].decrypt(member['document'].encode()).decode() if member['document'] else ''
     if not document:
-        raise asaas.AsaasError('Informe um CPF/CNPJ fictício válido para testar no Asaas Sandbox.')
+        raise asaas.AsaasError('Informe o CPF ou CNPJ do contribuinte.')
     ext = f'dizipy-member-{member["id"]}'
     result = api(donation['parish_id'], 'GET', '/customers', params={'externalReference':ext,'limit':2})
     items = result.get('data', [])
@@ -114,7 +134,7 @@ def customer_for(donation):
 
 
 def split_for(amount):
-    wallet = setting('platform_wallet')
+    wallet = setting('platform_live_wallet' if current_app.config['HOSTED'] else 'platform_wallet')
     return [{'walletId':wallet,'fixedValue':fee(amount)/100,'externalReference':'dizipy-fee'}] if wallet and fee(amount)>0 else []
 
 
@@ -139,14 +159,17 @@ def ensure_charge(donation_id):
     """Uma tentativa por vez; referências estáveis recuperam criações com resposta perdida."""
     with db() as connection:
         connection.execute('BEGIN IMMEDIATE')
-        row = connection.execute('SELECT d.*,p.account_status,a.payment_id FROM donation d JOIN parish p ON p.id=d.parish_id LEFT JOIN asaas_payment a ON a.donation_id=d.id WHERE d.id=?',(donation_id,)).fetchone()
+        row = connection.execute('SELECT d.*,p.account_status,p.live_account_status,p.live_account_id,p.live_account_cnpj,p.cnpj,p.cnpj_status,a.payment_id FROM donation d JOIN parish p ON p.id=d.parish_id LEFT JOIN asaas_payment a ON a.donation_id=d.id WHERE d.id=?',(donation_id,)).fetchone()
         if row is None:
             raise asaas.AsaasError('Contribuição não encontrada.')
         if row['mode']=='demo' or row['status'] in ('paid','cancelled','refunded'):
             return
+        check_payment_environment(row['mode'])
+        if row['mode']=='production' and not live_ready(row):
+            raise asaas.AsaasError('A igreja precisa de uma conta Asaas aprovada e vinculada ao CNPJ conferido.')
         if row['payment_id']:
             return
-        if row['account_status'] != 'APPROVED':
+        if row['mode']=='sandbox' and row['account_status'] != 'APPROVED':
             raise asaas.AsaasError('Verifique a conta recebedora em Integrações antes de gerar cobranças no Sandbox.')
         customer_id = row['customer_id'] or customer_for(row)
         connection.execute('UPDATE donation SET customer_id=? WHERE id=?',(customer_id,donation_id))
@@ -200,7 +223,7 @@ def ensure_recurring(recurring, donation, customer_id):
             if len(matches)>1:
                 raise asaas.AsaasError('Autorizações duplicadas no Asaas. Confira o contrato.')
             body = {'customerId':customer_id,'frequency':'MONTHLY','contractId':reference(recurring['id']),'startDate':now().date().isoformat(),'value':recurring['amount']/100,'description':'Contribuição mensal Dizipy','paymentCreationMode':'SUBSCRIPTION','retryPolicy':'NOT_ALLOWED','immediateQrCode':{'expirationSeconds':3600,'originalValue':donation['amount']/100,'description':'Primeira contribuição Dizipy'}}
-            pix_key = setting('pix_key',parish_id=parish_id)
+            pix_key = setting('pix_key',parish_id=parish_id) if not current_app.config['HOSTED'] else ''
             if pix_key:
                 body['immediateQrCode']['pixKey']=pix_key
             result = matches[0] if matches else api(parish_id,'POST','/pix/automatic/authorizations',data=body)
@@ -230,6 +253,15 @@ def update_payment(donation, payment):
     expected = db().execute('SELECT payment_id FROM asaas_payment WHERE donation_id=?',(donation['id'],)).fetchone()
     if not expected or expected['payment_id']!=payment.get('id') or type(value) not in (int,float) or not Decimal(str(value)).is_finite() or Decimal(str(value))*100!=donation['amount'] or payment.get('billingType')!=BILLING[donation['method']]:
         raise asaas.AsaasError('O evento não corresponde ao valor ou à forma de pagamento registrados.')
+    if donation['mode']=='production' and isinstance(payment.get('split'),list):
+        applied=0
+        for part in payment['split']:
+            if isinstance(part,dict) and part.get('externalReference')=='dizipy-fee':
+                fixed=part.get('fixedValue')
+                if type(fixed) in (float,int) and Decimal(str(fixed)).is_finite() and 0<fixed<=donation['amount']/100:
+                    applied+=int(Decimal(str(fixed))*100)
+        db().execute('UPDATE donation SET platform_fee=?,split_applied=? WHERE id=?',
+                     (min(applied,donation['amount']),int(bool(applied)),donation['id']))
     state = payment.get('status')
     if state=='RECEIVED' or (state=='CONFIRMED' and donation['method'] in ('card','card_monthly')):
         if donation['status'] in ('refunded','disputed'):
@@ -263,6 +295,7 @@ def refresh_charge(donation_id):
     donation=db().execute('SELECT d.*,a.payment_id FROM donation d LEFT JOIN asaas_payment a ON a.donation_id=d.id WHERE d.id=?',(donation_id,)).fetchone()
     if donation['mode']=='demo':
         return
+    check_payment_environment(donation['mode'])
     if not donation['payment_id']:
         ensure_charge(donation_id)
         return
@@ -298,7 +331,8 @@ def cancel_recurring(recurring):
         current=connection.execute('SELECT * FROM recurring WHERE id=?',(recurring['id'],)).fetchone()
         if current['status']=='cancelled':
             return
-        if current['mode']=='sandbox' and current['provider_id']:
+        if current['mode'] in ('sandbox','production') and current['provider_id']:
+            check_payment_environment(current['mode'])
             prefix='/subscriptions/' if current['method']=='card_monthly' else '/pix/automatic/authorizations/'
             path=prefix+provider_path(current['provider_id'])
             remote=api(current['parish_id'],'GET',path)
@@ -312,16 +346,23 @@ def cancel_recurring(recurring):
 def process_event(event):
     payload=json.loads(event['payload'])
     parish_id=event['parish_id']
+    environment=payload.get('_environment','sandbox')
+    if (environment=='production') != current_app.config['HOSTED']:
+        return
     kind=payload['event']
     payment=payload.get('payment')
     if kind.startswith('ACCOUNT_STATUS_'):
-        status=api(parish_id,'GET','/myAccount/status/').get('general')
+        account=api(parish_id,'GET','/myAccount/status/')
+        status=account.get('general')
         if status:
-            db().execute('UPDATE parish SET account_status=? WHERE id=?',(status,parish_id))
+            if environment=='production':
+                db().execute('UPDATE parish SET live_account_status=? WHERE id=? AND live_account_id=?',(status,parish_id,account.get('id')))
+            else:
+                db().execute('UPDATE parish SET account_status=? WHERE id=?',(status,parish_id))
         return
     if kind.startswith('PIX_AUTOMATIC_RECURRING_AUTHORIZATION_'):
         record=payload.get('authorization',{})
-        recurring=db().execute('SELECT * FROM recurring WHERE parish_id=? AND provider_id=?',(parish_id,record.get('id'))).fetchone()
+        recurring=db().execute('SELECT * FROM recurring WHERE parish_id=? AND provider_id=? AND mode=?',(parish_id,record.get('id'),environment)).fetchone()
         if recurring:
             # Consulta o estado atual para impedir reativação por um evento atrasado.
             current=api(parish_id,'GET','/pix/automatic/authorizations/'+provider_path(record['id']))
@@ -329,7 +370,7 @@ def process_event(event):
         return
     if kind.startswith('SUBSCRIPTION_'):
         record=payload.get('subscription',{})
-        recurring=db().execute('SELECT * FROM recurring WHERE parish_id=? AND provider_subscription=?',(parish_id,record.get('id'))).fetchone()
+        recurring=db().execute('SELECT * FROM recurring WHERE parish_id=? AND provider_subscription=? AND mode=?',(parish_id,record.get('id'),environment)).fetchone()
         if recurring and (kind=='SUBSCRIPTION_DELETED' or record.get('deleted')):
             db().execute("UPDATE recurring SET status='cancelled',cancelled_at=COALESCE(cancelled_at,?) WHERE id=?",(stamp(),recurring['id']))
         return
@@ -337,13 +378,13 @@ def process_event(event):
         return
     # Reconsulta na conta autenticada, conciliando eventos fora de ordem e estornos.
     payment=api(parish_id,'GET','/payments/'+provider_path(payment['id']))
-    donation=db().execute('SELECT d.* FROM donation d JOIN asaas_payment a ON a.donation_id=d.id WHERE a.payment_id=? AND d.parish_id=?',(payment['id'],parish_id)).fetchone()
+    donation=db().execute('SELECT d.* FROM donation d JOIN asaas_payment a ON a.donation_id=d.id WHERE a.payment_id=? AND d.parish_id=? AND d.mode=?',(payment['id'],parish_id,environment)).fetchone()
     if donation is None:
-        recurring=db().execute('SELECT * FROM recurring WHERE parish_id=? AND provider_subscription=?',(parish_id,payment.get('subscription'))).fetchone()
+        recurring=db().execute('SELECT * FROM recurring WHERE parish_id=? AND provider_subscription=? AND mode=?',(parish_id,payment.get('subscription'),environment)).fetchone()
         if recurring is None:
             ext=payment.get('externalReference','')
             if isinstance(ext,str) and ext.startswith('dizipy-'):
-                donation=db().execute('SELECT * FROM donation WHERE id=? AND parish_id=? AND mode="sandbox"',(ext[7:],parish_id)).fetchone()
+                donation=db().execute('SELECT * FROM donation WHERE id=? AND parish_id=? AND mode=?',(ext[7:],parish_id,environment)).fetchone()
         else:
             period=payment.get('dueDate')
             if not isinstance(period,str) or not re.fullmatch(r'\d{4}-\d{2}-\d{2}',period):
@@ -357,13 +398,13 @@ def process_event(event):
                     db().execute('UPDATE donation SET period=? WHERE id=?',(period,initial['id']))
                     donation=initial
                 else:
-                    donation_id=new_donation(parish_id,recurring['amount'],recurring['method'],recurring['member_id'],recurring['id'],period,'sandbox')
+                    donation_id=new_donation(parish_id,recurring['amount'],recurring['method'],recurring['member_id'],recurring['id'],period,environment)
                     donation=db().execute('SELECT * FROM donation WHERE id=?',(donation_id,)).fetchone()
         if donation:
             bind_payment(donation,payment,recurring_reference=bool(donation['recurring_id']))
     if donation:
         update_payment(donation,payment)
-    elif db().execute("SELECT 1 FROM recurring WHERE parish_id=? AND customer_id=? AND method='pix_monthly' AND mode='sandbox'",(parish_id,payment.get('customer'))).fetchone():
+    elif db().execute("SELECT 1 FROM recurring WHERE parish_id=? AND customer_id=? AND method='pix_monthly' AND mode=?",(parish_id,payment.get('customer'),environment)).fetchone():
         raise ValueError('Pix Automático recebido sem vínculo de assinatura. Confira a autorização e reprocesse este evento em Atividade.')
 
 

@@ -234,7 +234,8 @@ def create_app(config=None, *, webhook_only=False):
                         parish_id=connection.execute('INSERT INTO parish(public_id,name,email,password_hash,methods,cnpj) VALUES(?,?,?,?,?,?)',(secrets.token_urlsafe(12),name,email,password_hash,','.join(METHODS),cnpj)).lastrowid
                         first=not connection.execute('SELECT 1 FROM app_user').fetchone()
                         user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(email==app.config['ADMIN_EMAIL'] if app.config['HOSTED'] else first))).lastrowid
-                        put_setting('asaas_webhook_token',secrets.token_hex(32),parish_id,secret=True)
+                        hook_key='asaas_live_webhook_token' if app.config['HOSTED'] else 'asaas_webhook_token'
+                        put_setting(hook_key,secrets.token_hex(32),parish_id,secret=True)
                         audit(parish_id,'parish_registered',user_id=user_id)
                 except IntegrityError:
                     flash('Este e-mail já está cadastrado.')
@@ -278,6 +279,8 @@ def create_app(config=None, *, webhook_only=False):
                     abort(400,description='Período inválido.')
         query='SELECT d.*,m.name AS member_name,a.payment_id FROM donation d LEFT JOIN member m ON m.id=d.member_id LEFT JOIN asaas_payment a ON a.donation_id=d.id WHERE d.parish_id=?'
         params=[parish['id']]
+        if app.config['HOSTED']:
+            query+=" AND d.mode='production'"
         if start:
             query+=' AND substr(d.created_at,1,10)>=?'
             params.append(start)
@@ -302,7 +305,10 @@ def create_app(config=None, *, webhook_only=False):
         if request.args.get('pix_status')=='1':
             return {'version':version}
         people=db().execute('SELECT COUNT(*) FROM member WHERE parish_id=? AND active=1',(parish['id'],)).fetchone()[0]
-        recurring_count=db().execute("SELECT COUNT(*) FROM recurring WHERE parish_id=? AND status='active'",(parish['id'],)).fetchone()[0]
+        recurring_query="SELECT COUNT(*) FROM recurring WHERE parish_id=? AND status='active'"
+        if app.config['HOSTED']:
+            recurring_query+=" AND mode='production'"
+        recurring_count=db().execute(recurring_query,(parish['id'],)).fetchone()[0]
         return render_template('dashboard.html',parish=parish,donations=rows[:50],totals=totals,people=people,recurring_count=recurring_count,version=version)
 
     @app.get('/painel/exportar')
@@ -500,10 +506,55 @@ def create_app(config=None, *, webhook_only=False):
         parishes=db().execute('SELECT * FROM parish WHERE cnpj IS NOT NULL ORDER BY name').fetchall()
         return render_template('review_registrations.html',parishes=parishes)
 
+    def connect_live_account(parish, submitted_key):
+        if parish['cnpj_status']!='verified':
+            raise asaas.AsaasError('Conclua a revisão do CNPJ antes de conectar a conta recebedora.')
+        key=submitted_key or services.api_key(parish['id'])
+        if not key or len(key)>1024:
+            raise asaas.AsaasError('Informe uma chave de API de produção do Asaas.')
+        commercial=asaas.call(key,'GET','/myAccount/commercialInfo/',production=True)
+        status=asaas.call(key,'GET','/myAccount/status/',production=True)
+        try:
+            document=verification.normalize_cnpj(commercial.get('cpfCnpj') or '')
+        except ValueError:
+            raise asaas.AsaasError('A conta do Asaas precisa estar no CNPJ da igreja.') from None
+        account_id=status.get('id')
+        state=status.get('general')
+        if document!=parish['cnpj'] or not isinstance(account_id,str) or not account_id or not isinstance(state,str):
+            raise asaas.AsaasError('O Asaas não confirmou uma conta para o CNPJ cadastrado.')
+        with db() as connection:
+            connection.execute('BEGIN IMMEDIATE')
+            current=connection.execute('SELECT * FROM parish WHERE id=?',(parish['id'],)).fetchone()
+            if current['cnpj']!=document or current['cnpj_status']!='verified':
+                raise asaas.AsaasError('O cadastro da igreja mudou. Confira o CNPJ e tente novamente.')
+            if current['live_account_id'] and current['live_account_id']!=account_id:
+                raise asaas.AsaasError('Já existe uma conta recebedora vinculada a esta igreja.')
+            if connection.execute('SELECT 1 FROM parish WHERE live_account_id=? AND id<>?',
+                                  (account_id,parish['id'])).fetchone():
+                raise asaas.AsaasError('Esta conta recebedora já está vinculada a outro cadastro.')
+            put_setting('asaas_live_key',key,parish['id'],secret=True)
+            connection.execute(
+                'UPDATE parish SET live_account_id=?,live_account_cnpj=?,live_account_status=? WHERE id=?',
+                (account_id,document,state,parish['id']))
+            audit(parish['id'],'live_account_linked',state,current_user()['id'])
+
     @app.route('/integracoes',methods=['GET','POST'])
     @require('owner')
     def integrations():
         parish=current_parish()
+        if app.config['HOSTED']:
+            if request.method=='POST':
+                try:
+                    connect_live_account(parish,request.form.get('asaas_key','').strip())
+                except asaas.AsaasError as error:
+                    flash(str(error))
+                else:
+                    flash('Conta Asaas vinculada. Confira a situação e configure o webhook.')
+                return redirect(url_for('integrations'))
+            return render_template('integrations_live.html',parish=parish,
+                                   has_key=bool(services.api_key(parish['id'])),
+                                   hook_token=setting('asaas_live_webhook_token',parish_id=parish['id']),
+                                   hook_path='/webhooks/asaas/'+parish['public_id'])
         if request.method=='POST':
             action=request.form.get('action','save')
             if action=='check':
@@ -535,14 +586,14 @@ def create_app(config=None, *, webhook_only=False):
     def platform():
         local_admin()
         if request.method=='POST':
-            new_mode=request.form.get('mode','demo')
+            new_mode='production' if app.config['HOSTED'] else request.form.get('mode','demo')
             whatsapp_mode=request.form.get('whatsapp_mode','demo')
             public=request.form.get('public_url','').strip().rstrip('/')
             webhook=request.form.get('webhook_url','').strip().rstrip('/')
             if webhook and not re.fullmatch(r'https://[^\s/?#]+(?::[0-9]+)?',webhook):
                 flash('Informe um endereço HTTPS válido para o receptor.')
                 return redirect(url_for('platform'))
-            if new_mode not in ('demo','sandbox') or whatsapp_mode not in ('demo','cloud') or (public and not re.fullmatch(r'https?://[^\s/?#]+(?::[0-9]+)?',public)):
+            if (not app.config['HOSTED'] and new_mode not in ('demo','sandbox')) or whatsapp_mode not in ('demo','cloud') or (public and not re.fullmatch(r'https?://[^\s/?#]+(?::[0-9]+)?',public)):
                 flash('Confira o ambiente e o endereço público sem caminhos adicionais.')
                 return redirect(url_for('platform'))
             with db():
@@ -550,18 +601,22 @@ def create_app(config=None, *, webhook_only=False):
                     value=request.form.get(name,'').strip()
                     if len(value)>500:
                         abort(400)
-                    put_setting(name,value)
-                put_setting('mode',new_mode)
+                    key='platform_live_wallet' if app.config['HOSTED'] and name=='platform_wallet' else name
+                    put_setting(key,value)
+                if not app.config['HOSTED']:
+                    put_setting('mode',new_mode)
                 put_setting('whatsapp_mode',whatsapp_mode)
                 for name in ('whatsapp_token','whatsapp_app_secret'):
                     value=request.form.get(name,'').strip()
                     if value:
                         put_setting(name,value,secret=True)
                 audit(current_parish()['id'],'platform_settings_updated',new_mode,current_user()['id'])
-            flash('Configurações centrais salvas. A configuração de produção será feita após a homologação.')
+            flash('Configurações centrais salvas.')
             return redirect(url_for('platform'))
         keys=('public_url','webhook_url','whatsapp_phone_id','whatsapp_version','whatsapp_template','whatsapp_language','whatsapp_number','platform_wallet')
         settings={name:setting(name) for name in keys}
+        if app.config['HOSTED']:
+            settings['platform_wallet']=setting('platform_live_wallet')
         checks={'asaas':bool(setting('asaas_key')),'whatsapp':bool(setting('whatsapp_token')),'public':bool(setting('public_url'))}
         return render_template('platform.html',hosted=app.config['HOSTED'],settings=settings,checks=checks,verify_token=setting('whatsapp_verify_token'))
 
@@ -647,7 +702,16 @@ def create_app(config=None, *, webhook_only=False):
         name=request.form.get('name','').strip()
         phone=messaging.normalize_phone(request.form.get('phone',''))
         email=request.form.get('email','').strip().lower()
-        document=re.sub(r'\D','',request.form.get('document',''))
+        raw_document=request.form.get('document','').strip()
+        document=re.sub(r'[.\-/\s]','',raw_document)
+        if document and not re.fullmatch(r'[0-9]{11}',document):
+            document=verification.normalize_cnpj(document)
+        if public and app.config['HOSTED'] and existing and existing['document'] and document:
+            previous=secret_box().decrypt(existing['document'].encode()).decode()
+            has_payments=db().execute("SELECT 1 FROM donation WHERE member_id=? AND mode='production'",
+                                      (existing['id'],)).fetchone()
+            if has_payments and previous!=document:
+                raise ValueError('Para usar outro documento, inicie uma contribuição com outro cadastro.')
         if not 2<=len(name)<=120 or (email and not valid_email(email)) or (request.form.get('phone','').strip() and not phone):
             raise ValueError('Confira nome, e-mail e telefone com DDD.')
         if document and len(document) not in (11,14):
@@ -676,10 +740,16 @@ def create_app(config=None, *, webhook_only=False):
         member=db().execute('SELECT * FROM member WHERE manage_token=? AND parish_id=?',(token,parish['id'])).fetchone() if token else None
         enabled=[method for method in parish['methods'].split(',') if method in METHODS]
         mode=services.mode_for_new()
+        if mode=='production' and not services.live_ready(parish):
+            enabled=[]
         if request.method=='POST':
             amount=services.parse_amount(request.form.get('amount','').strip())
             method=request.form.get('method','')
-            if amount is None or method not in enabled:
+            if mode=='production' and not services.live_ready(parish):
+                flash('A igreja ainda está configurando a conta recebedora.')
+            elif mode=='production' and not (request.form.get('document','').strip() or (member and member['document'])):
+                flash('Informe seu CPF ou CNPJ para continuar.')
+            elif amount is None or method not in enabled:
                 flash('Escolha a forma disponível e informe um valor válido.')
             elif method.endswith('monthly') and request.form.get('recurring_consent')!='on':
                 flash('Confirme a autorização da contribuição mensal antes de continuar.')
@@ -713,6 +783,8 @@ def create_app(config=None, *, webhook_only=False):
         donation=db().execute('SELECT d.*,p.name AS parish_name,p.public_id,a.payment_id,m.manage_token FROM donation d JOIN parish p ON p.id=d.parish_id LEFT JOIN asaas_payment a ON a.donation_id=d.id LEFT JOIN member m ON m.id=d.member_id WHERE d.id=?',(donation_id,)).fetchone()
         if donation is None:
             abort(404)
+        if app.config['HOSTED'] and donation['mode']!='production':
+            abort(404)
         user=current_user()
         owner=user and user['parish_id']==donation['parish_id'] and allowed('finance')
         tokens=session.get('member_tokens',{})
@@ -722,6 +794,7 @@ def create_app(config=None, *, webhook_only=False):
         return donation
 
     @app.route('/simulacao/<donation_id>',methods=['GET','POST'])
+    @app.route('/pagamento/<donation_id>',methods=['GET','POST'])
     def demo_payment(donation_id):
         donation=accessible_donation(donation_id)
         version=donation['status']+'|'+str(donation['settled_at'] or '')
@@ -745,6 +818,7 @@ def create_app(config=None, *, webhook_only=False):
         return render_template('payment.html',donation=donation,recurring=recurring,version=version,show_personal=show_personal)
 
     @app.get('/simulacao/<donation_id>/qr')
+    @app.get('/pagamento/<donation_id>/qr')
     def payment_qr(donation_id):
         donation=accessible_donation(donation_id)
         if not donation['qr_payload']:
@@ -776,8 +850,9 @@ def create_app(config=None, *, webhook_only=False):
                 except asaas.AsaasError as error:
                     flash(str(error))
             return redirect(url_for('member_portal',token=token))
-        donations=db().execute('SELECT * FROM donation WHERE member_id=? ORDER BY created_at DESC LIMIT 30',(member['id'],)).fetchall()
-        recurring=db().execute('SELECT * FROM recurring WHERE member_id=? ORDER BY created_at DESC',(member['id'],)).fetchall()
+        history_filter=" AND mode='production'" if app.config['HOSTED'] else ''
+        donations=db().execute('SELECT * FROM donation WHERE member_id=?'+history_filter+' ORDER BY created_at DESC LIMIT 30',(member['id'],)).fetchall()
+        recurring=db().execute('SELECT * FROM recurring WHERE member_id=?'+history_filter+' ORDER BY created_at DESC',(member['id'],)).fetchall()
         central=setting('whatsapp_number')
         optin_url='https://wa.me/'+central+'?text='+quote('ATIVAR '+token) if re.fullmatch(r'\d{10,15}',central) else ''
         return render_template('member.html',member=member,donations=donations,recurring=recurring,optin_url=optin_url)
@@ -786,7 +861,12 @@ def create_app(config=None, *, webhook_only=False):
     @app.post('/webhooks/asaas/<public_id>')
     def asaas_webhook(public_id=None):
         parish=parish_by_public(public_id) if public_id else None
-        token=(setting('asaas_webhook_token',parish_id=parish['id']) if parish else '') or setting('asaas_webhook_token')
+        if app.config['HOSTED']:
+            if not parish or not parish['live_account_id']:
+                abort(404)
+            token=setting('asaas_live_webhook_token',parish_id=parish['id'])
+        else:
+            token=(setting('asaas_webhook_token',parish_id=parish['id']) if parish else '') or setting('asaas_webhook_token')
         supplied=request.headers.get('asaas-access-token','')
         if not token or not hmac.compare_digest(supplied.encode(),token.encode()):
             abort(401)
@@ -802,7 +882,7 @@ def create_app(config=None, *, webhook_only=False):
             if not parish:
                 return {'received':True,'ignored':True}
         # Persiste somente os campos necessários à conciliação, sem dados de cartão.
-        minimal={'id':body['id'],'event':body['event'],'dateCreated':body.get('dateCreated'),'accountStatus':body.get('accountStatus',{})}
+        minimal={'_environment':'production' if app.config['HOSTED'] else 'sandbox','id':body['id'],'event':body['event'],'dateCreated':body.get('dateCreated'),'accountStatus':body.get('accountStatus',{})}
         for resource in ('payment','subscription','authorization'):
             value=body.get(resource)
             if isinstance(value,dict):
