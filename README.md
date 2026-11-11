@@ -1,92 +1,63 @@
-# Dizipy
+# Dizipy — versão local integrada
 
-Primeira versão local para testar o painel da paróquia e a jornada de contribuição simulada. Use nomes, e-mails e senhas de teste. A aplicação roda com SQLite e funciona sem chaves de API.
+Painel para paróquias, fiéis, contribuições e lembretes. Esta versão permite testar a experiência inteira em demonstração, sem ngrok e sem movimentar dinheiro. Ainda não é a versão homologada para uso real pela paróquia.
 
-## Rodar no Windows
+## Abrir no Windows
 
-Na pasta do projeto, no PowerShell:
+1. Encerre as janelas antigas do Flask antes de atualizar. Faça uma cópia da pasta `instance` se já tiver dados de teste importantes.
+2. Atualize o código da branch `asaas-sandbox`.
+3. Dê dois cliques em **iniciar.bat** dentro da pasta do projeto. Python deve estar instalado. A primeira execução instala as dependências e precisa de internet.
+4. O navegador abre em http://127.0.0.1:5000. Mantenha a janela do inicializador aberta durante o uso.
 
-```powershell
-py -m venv .venv
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m flask --app app run
-```
+O inicializador sobe o painel, o receptor de eventos e a agenda juntos. Para encerrar, pressione Ctrl+C. Se as portas 5000 ou 5001 estiverem ocupadas, encerre os processos antigos antes de tentar novamente.
 
-Abra http://127.0.0.1:5000. No Linux ou macOS, use `python3 -m venv .venv` e troque `.\.venv\Scripts\python.exe` por `.venv/bin/python`.
+No Linux/macOS: crie `.venv`, instale `requirements.txt` e execute `.venv/bin/python run_local.py`.
 
-## Testar no celular
+## Primeiro percurso completo
 
-1. Na sua rede Wi-Fi privada, rode o mesmo comando Flask com `--host 0.0.0.0`.
-2. No Windows, use `ipconfig` para achar o IPv4 do computador na rede Wi-Fi. Abra o painel pelo endereço da rede, por exemplo `http://192.168.1.20:5000`, para que o QR Code contenha um endereço que o celular alcance.
-3. Cadastre uma paróquia fictícia, escaneie o QR Code com o celular na mesma rede, escolha o valor e simule a confirmação.
-4. Confira a contribuição no painel e exporte o CSV. No modo de teste, o valor líquido desconta só a taxa simulada da plataforma.
+- Cadastre uma paróquia fictícia ou entre com o cadastro local antigo. A primeira conta proprietária administra também a plataforma.
+- Em **Plataforma**, mantenha contribuição e WhatsApp em demonstração.
+- Abra o link público da paróquia. Teste Pix avulso, cartão avulso, cartão mensal e Pix Automático mensal. Os botões de simulação permitem acompanhar pagamento e falha sem conta bancária.
+- Nas formas mensais, confirme a autorização. Abra o link pessoal do fiel para conferir histórico e cancelar a recorrência.
+- Em **Recorrências**, avance o próximo ciclo de demonstração. O calendário real não precisa ser alterado.
+- Cadastre fiéis com consentimento para lembretes. Em **Lembretes**, edite mensagem, dia e horário e processe o mês. Veja as mensagens simuladas; repetir o processamento não duplica o lembrete mensal.
+- Confira o painel financeiro, filtros e CSV. Crie um colaborador com permissões limitadas e confira seu acesso.
+- Feche e reabra: dados, configurações e sessões persistem no computador.
 
-## Testar Pix no Asaas Sandbox
+No celular, use o IPv4 do computador com `http://IP:5000`, na mesma rede privada. Abra o painel por esse endereço antes de compartilhar seu link. O Windows pode pedir autorização de rede privada.
 
-Na pasta do projeto, pare o Flask com `Ctrl+C` e atualize as dependências. Digite a chave do Sandbox somente quando o PowerShell pedir. Ela fica disponível aos processos iniciados nessa janela.
+## O que está incluído
 
-```powershell
-.\.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:ASAAS_API_KEY = [System.Net.NetworkCredential]::new('', (Read-Host 'Chave do Asaas Sandbox' -AsSecureString)).Password
-$env:ASAAS_CUSTOMER_ID = .\.venv\Scripts\python.exe -m flask --app app asaas-cliente-teste
-.\.venv\Scripts\python.exe -m flask --app app run --host 0.0.0.0
-```
+Cadastro de paróquias, conta proprietária, colaboradores com permissões, cadastro de fiéis, portal pessoal, quatro jornadas de contribuição, recorrências, cancelamentos, histórico e exportação. A taxa prevista do Dizipy é 0,5%, com valores arredondados em centavos. O painel distingue previsão e tarifas retornadas pelo provedor.
 
-O comando `asaas-cliente-teste` cria um cadastro fictício no Sandbox com as notificações desabilitadas. Execute-o uma vez e guarde o identificador `cus_...` se quiser reutilizá-lo. Em outra sessão, defina `$env:ASAAS_CUSTOMER_ID = 'cus_...'` com o identificador guardado.
+O receptor guarda eventos antes de responder e a agenda os processa com verificação no Asaas. Há deduplicação de eventos, cobranças por período e mensagens por mês; falhas podem ser revisadas em Atividade. O acesso é separado por paróquia, formulários usam CSRF e configurações secretas ficam cifradas no disco.
 
-1. Abra o link de contribuição no celular pela rede privada e escolha **Pix avulso · Asaas Sandbox**. Digite um valor de teste, como `10,00`, e clique em **Gerar Pix de teste**.
-2. No painel do Asaas Sandbox, abra a cobrança usando a referência `pay_...` mostrada no Dizipy e simule a confirmação do pagamento.
-3. No Dizipy, toque em **Consultar pagamento**. Quando a API indicar o recebimento, atualize o painel da paróquia para ver **Pago**. Os totais e o CSV passam a incluir essa contribuição, com a mesma taxa simulada do protótipo.
+## Conectores externos: validação ainda necessária
 
-A URL da API aponta apenas para o Sandbox. O Pix usa um cliente fictício compartilhado neste ambiente de teste. A consulta manual continua disponível.
+**Asaas Sandbox:** cada proprietário configura sua chave em Integrações e verifica a situação da conta. A aprovação geral é consultada no Asaas antes de liberar novas cobranças de teste. A habilitação de Pix Automático depende da conta. Em Plataforma, mude novas contribuições para Sandbox; os registros antigos conservam o ambiente em que foram criados.
 
-## Testar a confirmação automática por webhook
+O painel escuta na porta 5000 e o receptor na 5001. Para homologar eventos externos, exponha apenas o receptor, por exemplo com um túnel HTTPS apontando para `http://127.0.0.1:5001`. Configure o endereço do receptor em Plataforma e copie a URL completa e o token individual em Integrações. Cadastre eventos de cobrança, assinatura, autorização Pix Automático e situação cadastral. Mantenha aplicativo e túnel abertos.
 
-Use o Asaas Sandbox e mantenha a chave da API e o ID de cliente já configurados. No mesmo PowerShell, pare o Flask com `Ctrl+C` e rode na pasta do projeto:
+O endereço público do aplicativo é separado do receptor: links de contribuição enviados ao fiel devem apontar para o painel, não para a porta exclusiva de webhooks.
 
-```powershell
-$env:ASAAS_WEBHOOK_TOKEN = .\.venv\Scripts\python.exe -c "import secrets; print(secrets.token_hex(32))"
-Start-Process -FilePath (Resolve-Path .\.venv\Scripts\python.exe).Path -ArgumentList '-m flask --app app:create_webhook_app run --host 127.0.0.1 --port 5001 --no-debugger --no-reload'
-```
+Pix avulso já foi validado anteriormente em Sandbox. As jornadas novas de cartão mensal e Pix Automático estão implementadas, mas precisam de homologação externa: autorização bancária, pagamento inicial, cobrança seguinte, cancelamento e estorno. Um Pix Automático sem vínculo conhecido é sinalizado em Atividade para conciliação, sem inventar confirmação financeira.
 
-Com o [ngrok para Windows](https://ngrok.com/download/windows) instalado e configurado com o token da sua conta ngrok, abra outro PowerShell e rode:
+O Split é solicitado para avulsos e assinaturas de cartão quando há carteira da plataforma configurada. **O primeiro pagamento por QR do Pix Automático não suporta Split na integração documentada.** A cobrança efetiva da taxa nesse caso permanece pendente de solução e homologação; a previsão local não representa transferência realizada.
 
-```powershell
-ngrok http http://127.0.0.1:5001
-```
+**WhatsApp:** utiliza um número empresarial central do Dizipy e a API oficial da Meta. A demonstração não envia mensagens. Para envio externo, configure número, ID, token, App Secret, versão da API e modelo aprovado em Plataforma. O modelo usa quatro parâmetros de corpo: nome do fiel, paróquia, texto configurado e link. A aprovação desse conteúdo precisa ser validada com a Meta.
 
-O túnel expõe o receptor da porta 5001. O painel e o checkout continuam na porta 5000 da rede local. No Asaas Sandbox, vá em **Menu do usuário → Integrações → Webhooks → Criar Webhook**.
+O webhook Meta é `/webhooks/whatsapp`, com verificação GET e assinatura HMAC nas notificações. Para receber lembretes reais, o fiel deve consentir e confirmar o telefone enviando `ATIVAR` com seu código pelo link pessoal. `SAIR` cancela os lembretes do número. Uma resposta incerta de envio não é reenviada automaticamente, evitando duplicidade. Credenciais, aprovação do modelo e entrega real ainda precisam ser homologadas.
 
-- Em **URL**, use o endereço HTTPS do ngrok com `/webhooks/asaas` no final.
-- Depois de preencher a URL, rode `Set-Clipboard -Value $env:ASAAS_WEBHOOK_TOKEN` no PowerShell original e cole o valor em **Auth Token**. É um token próprio do webhook.
-- Preencha o nome e o e-mail de alerta, mantenha o webhook e a fila ativos e selecione os eventos `PAYMENT_RECEIVED` e `PAYMENT_CONFIRMED`.
+## Dados e cópias de segurança
 
-Salve o webhook e inicie o painel no PowerShell original:
+Os dados ficam em `instance`; mantenha essa pasta fora do Git. As chaves `local.key` e `session.key` devem acompanhar o banco: sem elas, configurações cifradas não podem ser recuperadas. Não compartilhe backups com terceiros.
 
-```powershell
-.\.venv\Scripts\python.exe -m flask --app app run --host 0.0.0.0
-```
+O inicializador faz uma cópia diária e mantém as sete últimas em `instance/backups`. O administrador da plataforma pode baixar um backup completo. Para restaurar, encerre o aplicativo, guarde a pasta atual e extraia banco e chaves na pasta de dados, preservando o nome do banco usado pela instalação. Consulte `DIZIPY_DATABASE` se estiver usando caminho personalizado. Nunca restaure com o servidor aberto.
 
-Crie uma cobrança Pix nova no Dizipy e simule a confirmação no Asaas. Com a página de pagamento ou o painel aberto, aguarde alguns segundos até aparecer **Pago**. As telas consultam o banco local. Se você estiver editando as preferências do painel, salve ou recarregue a página para ver a mudança. Nos **Logs de Webhooks** do Asaas, a entrega correspondente deve retornar HTTP 200.
+O esquema anterior é migrado preservando cadastros e contribuições. Antes da primeira atualização, mantenha uma cópia independente dos dados antigos.
 
-Ao encerrar o teste, desative o webhook temporário no Asaas e feche o túnel. Para reutilizá-lo, mantenha o mesmo token configurado no Asaas e em `ASAAS_WEBHOOK_TOKEN`, e atualize a URL se ela mudar.
+## Verificação de desenvolvimento
 
-## Testar cartão avulso no Sandbox
+Execute `.venv/bin/python -m unittest discover -s tests -v` (Windows: `.venv\Scripts\python.exe`). Os testes cobrem quatro jornadas de demonstração, recorrência, cancelamento, persistência, migração, permissões, isolamento, CSRF, agenda, consentimento e eventos Sandbox com respostas simuladas. Testes simulados não substituem homologação com os provedores.
 
-Antes de atualizar, pare os dois processos Flask (painel na porta 5000 e receptor na porta 5001). Atualize a branch e reinicie cada processo na mesma janela em que suas variáveis já estão configuradas. A migração do banco local preserva as cobranças Pix existentes.
-
-1. No webhook do Asaas Sandbox, mantenha `PAYMENT_RECEIVED` marcado e acrescente `PAYMENT_CONFIRMED`. Salve.
-2. No link de contribuição, selecione **Cartão avulso · Asaas Sandbox**, informe um valor de teste e clique em **Gerar pagamento com cartão**.
-3. Abra **Pagar com cartão no Asaas Sandbox**. A fatura abre em outra aba. Use somente dados fictícios e um dos [cartões oficiais de teste do Asaas](https://docs.asaas.com/docs/testando-pagamento-com-cart%C3%A3o-de-cr%C3%A9dito).
-4. Para testar aprovação, use `4539656048392220`, validade futura, CCV `123` e nome fictício. Para testar recusa em outra cobrança, use `5184019740373151`.
-5. Volte à aba do Dizipy para acompanhar a confirmação automática. O painel e o CSV incluem somente as contribuições confirmadas. Uma recusa deve manter a contribuição pendente.
-
-O cartão avulso é confirmado quando o Asaas informar `CONFIRMED` ou `RECEIVED`. A confirmação do pagamento e a disponibilidade do saldo são etapas distintas. O Pix continua exigindo `RECEIVED`. O líquido do painel permanece simulado e desconta somente a taxa Dizipy do protótipo.
-
-A fatura de teste aceita somente um endereço HTTPS do domínio `sandbox.asaas.com`. Os dados do cartão são preenchidos no Asaas. O cliente fictício configurado no Sandbox é reutilizado neste protótipo.
-
-## Escopo desta versão
-
-O QR Code abre o simulador web. Sem as variáveis do Asaas, as quatro formas usam o simulador local. Com o Sandbox configurado, Pix avulso e cartão avulso usam a API do Asaas. O painel salva o dia e horário do lembrete, mas o envio ainda não está ligado.
-
-O próximo passo inclui conectar Meta e IA, adicionar permissões por colaborador, ativação após verificação da conta de recebimento e execução dos lembretes com a regra de contato mensal. O piloto usa PostgreSQL no Neon e um workspace separado no Render. Esta versão local é exclusivamente para testes fictícios.
+Antes de disponibilizar à paróquia: concluir homologação dos quatro meios e WhatsApp, definir cobrança efetiva da taxa, preparar hospedagem e banco de produção, proteger credenciais, validar restauração de backup e realizar piloto acompanhado. Produção permanece desabilitada nesta versão.

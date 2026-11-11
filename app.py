@@ -1,504 +1,698 @@
+"""Dizipy local. Execute iniciar.bat para abrir a aplicação e a agenda."""
 import csv
+import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
 import sqlite3
-from datetime import datetime
-from decimal import Decimal, ROUND_HALF_UP
+import time
+from datetime import date
+from functools import wraps
 from io import BytesIO, StringIO
 from pathlib import Path
-from urllib.parse import urlsplit
-from zoneinfo import ZoneInfo
+from urllib.parse import quote
 
 import click
 import qrcode
-
-import asaas
-from flask import (
-    Flask, Response, abort, flash, g, redirect, render_template, request,
-    send_file, session, url_for,
-)
+from cryptography.fernet import Fernet
+from flask import Flask, Response, abort, flash, g, redirect, render_template, request, send_file, session, url_for
 from werkzeug.security import check_password_hash, generate_password_hash
 
-METHODS = {
-    "pix": "Pix avulso",
-    "card": "Cartão avulso",
-    "card_monthly": "Cartão recorrente",
-    "pix_monthly": "Pix Automático",
-}
-ASAAS_METHODS = {"pix": "PIX", "card": "CREDIT_CARD"}
-SAO_PAULO = ZoneInfo("America/Sao_Paulo")
+import asaas
+import messaging
+import services
+from storage import audit, close_db, db, durable_secret, initialize, now, put_setting, secret_box, setting, stamp
 
-
-def now():
-    return datetime.now(SAO_PAULO)
-
-
-def money(cents):
-    value = f"{Decimal(cents) / 100:,.2f}".translate(str.maketrans(".,", ",."))
-    return f"R$ {value}"
-
-
-def parse_amount(value):
-    if not re.fullmatch(r"[0-9]{1,6}(?:[,.][0-9]{1,2})?", value):
-        return None
-    cents = int(Decimal(value.replace(",", ".")) * 100)
-    return cents if cents > 0 else None
-
-
-def matches_payment(payment, donation):
-    value = payment.get("value")
-    return (
-        payment.get("id") == donation["payment_id"]
-        and payment.get("externalReference") == "dizipy-" + donation["id"]
-        and payment.get("billingType") == ASAAS_METHODS.get(donation["method"])
-        and type(value) in (int, float)
-        and Decimal(str(value)) * 100 == donation["amount"]
-    )
-
-
-def payment_confirmed(payment, donation):
-    return payment.get("status") == "RECEIVED" or (
-        donation["method"] == "card" and payment.get("status") == "CONFIRMED"
-    )
+METHODS=services.METHODS
+PERMISSIONS={'finance':'Consultar e exportar contribuições','people':'Gerenciar fiéis','reminders':'Editar os lembretes'}
 
 
 def create_app(config=None, *, webhook_only=False):
-    app = Flask(__name__)
-    app.config.update(
-        SECRET_KEY=os.environ.get("DIZIPY_SECRET_KEY") or secrets.token_hex(32),
-        DATABASE=Path(app.instance_path) / "dizipy.sqlite",
-        SESSION_COOKIE_HTTPONLY=True,
-        SESSION_COOKIE_SAMESITE="Lax",
-        MAX_CONTENT_LENGTH=16_384,
-        ASAAS_API_KEY=os.environ.get("ASAAS_API_KEY", "").strip(),
-        ASAAS_CUSTOMER_ID=os.environ.get("ASAAS_CUSTOMER_ID", "").strip(),
-        ASAAS_WEBHOOK_TOKEN=os.environ.get("ASAAS_WEBHOOK_TOKEN", "").strip(),
-    )
+    app=Flask(__name__)
+    instance=Path(app.instance_path)
+    app.config.update(DATABASE=os.environ.get('DIZIPY_DATABASE') or instance/'dizipy.sqlite',SESSION_COOKIE_HTTPONLY=True,SESSION_COOKIE_SAMESITE='Lax',MAX_CONTENT_LENGTH=262144,ASAAS_CUSTOMER_ID=os.environ.get('ASAAS_CUSTOMER_ID',''),TESTING=False)
     if config:
         app.config.update(config)
-    sandbox_enabled = bool(app.config["ASAAS_API_KEY"] and app.config["ASAAS_CUSTOMER_ID"])
-    webhook_token = app.config["ASAAS_WEBHOOK_TOKEN"]
-    if webhook_token and not re.fullmatch(r"\S{32,255}", webhook_token):
-        raise ValueError("ASAAS_WEBHOOK_TOKEN deve ter de 32 a 255 caracteres sem espaços.")
-    app.jinja_env.globals["webhook_enabled"] = bool(webhook_token)
-    Path(app.config["DATABASE"]).parent.mkdir(parents=True, exist_ok=True)
-    app.add_template_filter(money, "money")
-
-    def db():
-        if "db" not in g:
-            g.db = sqlite3.connect(app.config["DATABASE"], timeout=15)
-            g.db.row_factory = sqlite3.Row
-            g.db.execute("PRAGMA foreign_keys = ON")
-        return g.db
-
-    @app.teardown_appcontext
-    def close_db(_error):
-        connection = g.pop("db", None)
-        if connection is not None:
-            connection.close()
-
+    data_dir=Path(app.config['DATABASE']).parent
+    data_dir.mkdir(parents=True,exist_ok=True)
+    app.config.setdefault('LOCAL_ENCRYPTION_KEY',durable_secret(data_dir/'local.key',Fernet.generate_key()))
+    app.config['SECRET_KEY']=app.config.get('SECRET_KEY') or os.environ.get('DIZIPY_SECRET_KEY') or durable_secret(data_dir/'session.key',secrets.token_bytes(32)).hex()
+    app.extensions['secrets']=Fernet(app.config['LOCAL_ENCRYPTION_KEY'])
+    app.teardown_appcontext(close_db)
     with app.app_context():
-        with db() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            legacy_table = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'asaas_pix'"
-            ).fetchone()
-            if legacy_table:
-                connection.execute("ALTER TABLE asaas_pix RENAME TO asaas_payment")
-        db().executescript("""
-            CREATE TABLE IF NOT EXISTS parish (
-                id INTEGER PRIMARY KEY,
-                public_id TEXT NOT NULL UNIQUE,
-                name TEXT NOT NULL,
-                email TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                methods TEXT NOT NULL,
-                reminder_day INTEGER NOT NULL DEFAULT 10,
-                reminder_time TEXT NOT NULL DEFAULT '09:00'
-            );
-            CREATE TABLE IF NOT EXISTS donation (
-                id TEXT PRIMARY KEY,
-                parish_id INTEGER NOT NULL REFERENCES parish(id),
-                amount INTEGER NOT NULL CHECK (amount > 0),
-                platform_fee INTEGER NOT NULL,
-                method TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                paid_at TEXT
-            );
-            CREATE TABLE IF NOT EXISTS asaas_payment (
-                donation_id TEXT PRIMARY KEY REFERENCES donation(id),
-                payment_id TEXT UNIQUE
-            );
-            CREATE TABLE IF NOT EXISTS asaas_webhook_event (
-                id TEXT PRIMARY KEY,
-                donation_id TEXT NOT NULL REFERENCES donation(id)
-            );
-        """)
-
-    @app.cli.command("asaas-cliente-teste")
-    def asaas_test_customer():
-        """Cria um cliente fictício no Sandbox e imprime seu identificador."""
-        if not app.config["ASAAS_API_KEY"]:
-            raise click.ClickException("Configure ASAAS_API_KEY antes de executar este comando.")
-        try:
-            customer = asaas.call(app.config["ASAAS_API_KEY"], "POST", "/customers", data={
-                "name": "Cliente Teste Dizipy",
-                "cpfCnpj": "24971563792",
-                "notificationDisabled": True,
-            })
-        except asaas.AsaasError as error:
-            raise click.ClickException(str(error)) from None
-        customer_id = customer.get("id")
-        if not isinstance(customer_id, str) or not re.fullmatch(r"cus_[A-Za-z0-9]+", customer_id):
-            raise click.ClickException("O Asaas Sandbox não devolveu um identificador de cliente válido.")
-        click.echo(customer_id)
+        initialize()
+    app.add_template_filter(services.money,'money')
+    app.add_template_filter(lambda value: services.LABELS.get(value,value),'label')
+    app.add_template_filter(lambda value: str(value or '')[:16].replace('T',' '),'datetime')
 
     def csrf_token():
-        if "csrf" not in session:
-            session["csrf"] = secrets.token_urlsafe(32)
-        return session["csrf"]
+        if 'csrf' not in session:
+            session['csrf']=secrets.token_urlsafe(32)
+        return session['csrf']
 
-    app.jinja_env.globals["csrf_token"] = csrf_token
-    app.jinja_env.globals["methods"] = METHODS
-
-    @app.before_request
-    def check_csrf():
-        is_webhook = request.endpoint == "asaas_webhook"
-        if webhook_only and not is_webhook:
-            abort(404)
-        if request.method == "POST" and not is_webhook:
-            provided = request.form.get("csrf", "")
-            expected = session.get("csrf", "")
-            if not expected or not hmac.compare_digest(provided.encode(), expected.encode()):
-                abort(400)
-
-    @app.after_request
-    def response_headers(response):
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        return response
+    def current_user():
+        if 'current_user' not in g:
+            g.current_user=db().execute('SELECT * FROM app_user WHERE id=? AND active=1',(session.get('user_id'),)).fetchone()
+        return g.current_user
 
     def current_parish():
-        return db().execute("SELECT * FROM parish WHERE id = ?", (session.get("parish_id"),)).fetchone()
+        user=current_user()
+        return db().execute('SELECT * FROM parish WHERE id=?',(user['parish_id'],)).fetchone() if user else None
 
-    def public_parish(public_id):
-        parish = db().execute("SELECT * FROM parish WHERE public_id = ?", (public_id,)).fetchone()
-        if parish is None:
+    def allowed(permission):
+        user=current_user()
+        return bool(user and (user['role']=='owner' or permission in json.loads(user['permissions'])))
+
+    def require(permission=None):
+        def decorate(function):
+            @wraps(function)
+            def wrapped(*args,**kwargs):
+                if current_user() is None:
+                    return redirect(url_for('home'))
+                if permission=='owner' and current_user()['role']!='owner':
+                    abort(403)
+                if permission and permission!='owner' and not allowed(permission):
+                    abort(403)
+                return function(*args,**kwargs)
+            return wrapped
+        return decorate
+
+    def parish_by_public(public_id):
+        row=db().execute('SELECT * FROM parish WHERE public_id=?',(public_id,)).fetchone()
+        if row is None:
             abort(404)
-        return parish
+        return row
 
-    @app.get("/health")
+    def local_admin():
+        user=current_user()
+        if not user or not user['platform_admin']:
+            abort(403)
+
+    @app.context_processor
+    def template_context():
+        return {'csrf_token':csrf_token,'methods':METHODS,'permissions':PERMISSIONS,'user':current_user(),'can':allowed,'current_parish':current_parish(),'mode':services.mode_for_new(),'whatsapp_mode':setting('whatsapp_mode','demo'),'provider_url':services.public_url,'labels':services.LABELS}
+
+    @app.before_request
+    def security_checks():
+        is_hook=request.endpoint in ('asaas_webhook','whatsapp_webhook')
+        if webhook_only and not is_hook:
+            abort(404)
+        if request.method=='POST' and not is_hook:
+            provided=request.form.get('csrf','')
+            expected=session.get('csrf','')
+            if not expected or not hmac.compare_digest(provided.encode(),expected.encode()):
+                abort(400,description='A sessão expirou. Recarregue a página e tente novamente.')
+
+    @app.after_request
+    def headers(response):
+        response.headers['Cache-Control']='no-store'
+        response.headers['X-Content-Type-Options']='nosniff'
+        response.headers['Referrer-Policy']='same-origin'
+        response.headers['X-Frame-Options']='DENY'
+        return response
+
+    @app.errorhandler(400)
+    @app.errorhandler(403)
+    @app.errorhandler(404)
+    @app.errorhandler(413)
+    @app.errorhandler(429)
+    def friendly_error(error):
+        return render_template('error.html',error=error),error.code
+
+    @app.get('/health')
     def health():
-        return {"status": "ok", "mode": "asaas_sandbox" if sandbox_enabled else "demo"}
+        return {'status':'ok','mode':services.mode_for_new()}
 
-    @app.get("/")
+    @app.get('/')
     def home():
-        if current_parish():
-            return redirect(url_for("dashboard"))
-        return render_template("auth.html", register=False)
+        return redirect(url_for('dashboard')) if current_user() else render_template('auth.html',register=False)
 
-    @app.route("/cadastro", methods=["GET", "POST"])
+    @app.route('/cadastro',methods=['GET','POST'])
     def register():
-        if request.method == "POST":
-            name = request.form.get("name", "").strip()
-            email = request.form.get("email", "").strip().lower()
-            password = request.form.get("password", "")
-            if not 2 <= len(name) <= 120 or len(email) > 254 or not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+", email):
-                flash("Informe o nome da paróquia e um e-mail válido para o teste.")
-            elif not 10 <= len(password) <= 128:
-                flash("A senha precisa ter entre 10 e 128 caracteres.")
+        if request.method=='POST':
+            name=request.form.get('name','').strip()
+            email=request.form.get('email','').strip().lower()
+            password=request.form.get('password','')
+            if not 2<=len(name)<=120 or not valid_email(email) or not 10<=len(password)<=128:
+                flash('Informe um nome, e-mail válido e senha de 10 a 128 caracteres.')
             else:
                 try:
                     with db() as connection:
-                        parish_id = connection.execute(
-                            "INSERT INTO parish (public_id, name, email, password_hash, methods) VALUES (?, ?, ?, ?, ?)",
-                            (secrets.token_urlsafe(12), name, email, generate_password_hash(password), ",".join(METHODS)),
-                        ).lastrowid
+                        connection.execute('BEGIN IMMEDIATE')
+                        password_hash=generate_password_hash(password)
+                        parish_id=connection.execute('INSERT INTO parish(public_id,name,email,password_hash,methods) VALUES(?,?,?,?,?)',(secrets.token_urlsafe(12),name,email,password_hash,','.join(METHODS))).lastrowid
+                        first=not connection.execute('SELECT 1 FROM app_user').fetchone()
+                        user_id=connection.execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,platform_admin) VALUES(?,?,?,?,'owner',?)",(parish_id,name,email,password_hash,int(first))).lastrowid
+                        put_setting('asaas_webhook_token',secrets.token_hex(32),parish_id,secret=True)
+                        audit(parish_id,'parish_registered',user_id=user_id)
                 except sqlite3.IntegrityError:
-                    flash("Já existe uma conta com esse e-mail.")
+                    flash('Este e-mail já está cadastrado.')
                 else:
                     session.clear()
-                    session["parish_id"] = parish_id
-                    return redirect(url_for("dashboard"))
-        return render_template("auth.html", register=True)
+                    session['user_id']=user_id
+                    return redirect(url_for('dashboard'))
+        return render_template('auth.html',register=True)
 
-    @app.post("/entrar")
+    @app.post('/entrar')
     def login():
-        email = request.form.get("email", "").strip().lower()
-        password = request.form.get("password", "")
-        parish = db().execute("SELECT * FROM parish WHERE email = ?", (email,)).fetchone()
-        if parish and len(password) <= 128 and check_password_hash(parish["password_hash"], password):
+        email=request.form.get('email','').strip().lower()
+        password=request.form.get('password','')
+        key=hashlib.sha256(((request.remote_addr or '')+'|'+email).encode()).hexdigest()
+        attempt=db().execute('SELECT * FROM login_attempt WHERE key=?',(key,)).fetchone()
+        if attempt and attempt['blocked_until']>time.time():
+            abort(429,description='Muitas tentativas. Aguarde alguns minutos.')
+        user=db().execute('SELECT * FROM app_user WHERE email=? AND active=1',(email,)).fetchone()
+        if user and len(password)<=128 and check_password_hash(user['password_hash'],password):
+            with db():
+                db().execute('DELETE FROM login_attempt WHERE key=?',(key,))
             session.clear()
-            session["parish_id"] = parish["id"]
-            return redirect(url_for("dashboard"))
-        flash("E-mail ou senha inválidos.")
-        return redirect(url_for("home"))
+            session['user_id']=user['id']
+            return redirect(url_for('dashboard'))
+        with db():
+            failures=(attempt['failures'] if attempt else 0)+1
+            db().execute('INSERT INTO login_attempt VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET failures=excluded.failures,blocked_until=excluded.blocked_until',(key,failures,time.time()+300 if failures>=8 else 0))
+        flash('E-mail ou senha inválidos.')
+        return redirect(url_for('home'))
 
-    @app.post("/sair")
+    @app.post('/sair')
     def logout():
         session.clear()
-        return redirect(url_for("home"))
+        return redirect(url_for('home'))
 
-    @app.route("/painel", methods=["GET", "POST"])
+    def report_rows():
+        parish=current_parish()
+        start=request.args.get('inicio','')
+        end=request.args.get('fim','')
+        for value in (start,end):
+            if value:
+                try:
+                    date.fromisoformat(value)
+                except ValueError:
+                    abort(400,description='Período inválido.')
+        query='SELECT d.*,m.name AS member_name,a.payment_id FROM donation d LEFT JOIN member m ON m.id=d.member_id LEFT JOIN asaas_payment a ON a.donation_id=d.id WHERE d.parish_id=?'
+        params=[parish['id']]
+        if start:
+            query+=' AND substr(d.created_at,1,10)>=?'
+            params.append(start)
+        if end:
+            query+=' AND substr(d.created_at,1,10)<=?'
+            params.append(end)
+        return db().execute(query+' ORDER BY d.created_at DESC,d.id',params).fetchall()
+
+    @app.route('/painel',methods=['GET','POST'])
+    @require()
     def dashboard():
-        parish = current_parish()
-        if parish is None:
-            return redirect(url_for("home"))
-        if request.method == "POST":
-            chosen = set(request.form.getlist("methods"))
-            day = request.form.get("day", "")
-            hour = request.form.get("time", "")
-            if not chosen <= METHODS.keys() or not re.fullmatch(r"(?:[1-9]|[12][0-9]|3[01])", day) or not re.fullmatch(
-                r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", hour
-            ):
-                flash("Confira o dia, o horário e as formas de pagamento.")
-            else:
-                with db() as connection:
-                    connection.execute(
-                        "UPDATE parish SET methods = ?, reminder_day = ?, reminder_time = ? WHERE id = ?",
-                        (",".join(method for method in METHODS if method in chosen), int(day), hour, parish["id"]),
-                    )
-                flash("Preferências salvas no modo de teste.")
-            return redirect(url_for("dashboard"))
+        parish=current_parish()
+        if request.method=='POST':
+            if not allowed('reminders'):
+                abort(403)
+            save_reminders(parish)
+            return redirect(url_for('dashboard'))
+        rows=report_rows() if allowed('finance') else []
+        paid=[row for row in rows if row['status']=='paid']
+        totals={'gross':sum(row['amount'] for row in paid),'fee':sum(row['platform_fee'] for row in paid),'count':len(paid),'pending':sum(row['status']=='pending' for row in rows)}
+        version=hashlib.sha256(json.dumps([(row['id'],row['status'],row['settled_at']) for row in rows]).encode()).hexdigest()[:16]
+        if request.args.get('pix_status')=='1':
+            return {'version':version}
+        people=db().execute('SELECT COUNT(*) FROM member WHERE parish_id=? AND active=1',(parish['id'],)).fetchone()[0]
+        recurring_count=db().execute("SELECT COUNT(*) FROM recurring WHERE parish_id=? AND status='active'",(parish['id'],)).fetchone()[0]
+        return render_template('dashboard.html',parish=parish,donations=rows[:50],totals=totals,people=people,recurring_count=recurring_count,version=version)
 
-        # O contador e a lista devem refletir o mesmo estado quando chega um webhook.
-        connection = db()
-        connection.execute("BEGIN")
-        totals = connection.execute("""
-            SELECT COUNT(*) AS count, COALESCE(SUM(amount), 0) AS gross,
-                   COALESCE(SUM(platform_fee), 0) AS fee
-            FROM donation WHERE parish_id = ? AND paid_at IS NOT NULL
-        """, (parish["id"],)).fetchone()
-        if request.args.get("pix_status") == "1":
-            return {"version": totals["count"]}
-        donations = connection.execute("""
-            SELECT donation.*, asaas_payment.donation_id IS NOT NULL AS sandbox_payment
-            FROM donation LEFT JOIN asaas_payment ON asaas_payment.donation_id = donation.id
-            WHERE parish_id = ? ORDER BY created_at DESC LIMIT 20
-        """, (parish["id"],)).fetchall()
-        connection.commit()
-        return render_template("dashboard.html", parish=parish, totals=totals, donations=donations)
-
-    @app.get("/painel/exportar")
+    @app.get('/painel/exportar')
+    @require('finance')
     def export_donations():
-        parish = current_parish()
-        if parish is None:
-            return redirect(url_for("home"))
-        donations = db().execute("""
-            SELECT * FROM donation WHERE parish_id = ? AND paid_at IS NOT NULL ORDER BY paid_at DESC
-        """, (parish["id"],))
-        output = StringIO()
-        writer = csv.writer(output, delimiter=";")
-        writer.writerow(["Identificador", "Forma", "Valor bruto", "Taxa Dizipy", "Valor líquido simulado", "Confirmado em"])
-        for row in donations:
-            writer.writerow([
-                "dizipy-" + row["id"], METHODS[row["method"]], money(row["amount"]), money(row["platform_fee"]),
-                money(row["amount"] - row["platform_fee"]), row["paid_at"],
-            ])
-        return Response(
-            output.getvalue().encode("utf-8-sig"), mimetype="text/csv",
-            headers={"Content-Disposition": 'attachment; filename="contribuicoes-dizipy.csv"'},
-        )
+        output=StringIO()
+        writer=csv.writer(output,delimiter=';')
+        writer.writerow(['Referência','Contribuinte','Forma','Ambiente','Status','Bruto','Taxa Dizipy prevista','Tarifa Asaas informada','Líquido estimado','Confirmado em'])
+        for row in report_rows():
+            writer.writerow([csv_safe(row['id']),csv_safe(row['member_name'] or ''),METHODS[row['method']],row['mode'],services.LABELS.get(row['status'],row['status']),services.money(row['amount']),services.money(row['platform_fee']),services.money(row['provider_fee']) if row['provider_fee'] is not None else '',services.money(row['amount']-row['platform_fee']-(row['provider_fee'] or 0)),row['paid_at'] or ''])
+        return Response(output.getvalue().encode('utf-8-sig'),mimetype='text/csv',headers={'Content-Disposition':'attachment; filename="contribuicoes-dizipy.csv"'})
 
-    @app.get("/contribuir/<public_id>/qr")
-    def parish_qr(public_id):
-        public_parish(public_id)
-        data = url_for("contribute", public_id=public_id, _external=True)
-        buffer = BytesIO()
-        qrcode.make(data).save(buffer, format="PNG")
-        buffer.seek(0)
-        return send_file(buffer, mimetype="image/png")
+    @app.route('/fieis',methods=['GET','POST'])
+    @require('people')
+    def people():
+        parish=current_parish()
+        if request.method=='POST':
+            try:
+                with db():
+                    member_id=save_member(parish['id'])
+                    audit(parish['id'],'member_saved',str(member_id),current_user()['id'])
+                flash('Cadastro salvo. A adesão ao WhatsApp é confirmada pelo próprio fiel.')
+            except ValueError as error:
+                flash(str(error))
+            return redirect(url_for('people'))
+        members=db().execute('SELECT * FROM member WHERE parish_id=? ORDER BY active DESC,name',(parish['id'],)).fetchall()
+        return render_template('people.html',members=members)
 
-    @app.route("/contribuir/<public_id>", methods=["GET", "POST"])
-    def contribute(public_id):
-        parish = public_parish(public_id)
-        enabled = parish["methods"].split(",")
-        if request.method == "POST":
-            amount = parse_amount(request.form.get("amount", "").strip())
-            method = request.form.get("method", "")
-            if amount is None or method not in METHODS or method not in enabled:
-                flash("Escolha uma forma disponível e digite um valor válido.")
-            else:
-                donation_id = secrets.token_urlsafe(18)
-                fee = int((Decimal(amount) * Decimal("0.005")).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
-                with db() as connection:
-                    connection.execute(
-                        "INSERT INTO donation (id, parish_id, amount, platform_fee, method, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                        (donation_id, parish["id"], amount, fee, method, now().isoformat()),
-                    )
-                    if sandbox_enabled and method in ASAAS_METHODS:
-                        connection.execute("INSERT INTO asaas_payment (donation_id) VALUES (?)", (donation_id,))
-                session["demo_donation"] = donation_id
-                return redirect(url_for("demo_payment", donation_id=donation_id))
-        return render_template("contribute.html", parish=parish, enabled=enabled, sandbox_enabled=sandbox_enabled)
-
-    @app.route("/simulacao/<donation_id>", methods=["GET", "POST"])
-    def demo_payment(donation_id):
-        donation = db().execute("""
-            SELECT donation.*, parish.name AS parish_name,
-                   asaas_payment.donation_id IS NOT NULL AS sandbox_payment, asaas_payment.payment_id
-            FROM donation JOIN parish ON parish.id = donation.parish_id
-            LEFT JOIN asaas_payment ON asaas_payment.donation_id = donation.id WHERE donation.id = ?
-        """, (donation_id,)).fetchone()
-        if donation is None:
+    @app.post('/fieis/<int:member_id>/atualizar')
+    @require('people')
+    def edit_member(member_id):
+        member=db().execute('SELECT * FROM member WHERE id=? AND parish_id=?',(member_id,current_parish()['id'])).fetchone()
+        if not member:
             abort(404)
-        owns_checkout = session.get("demo_donation") == donation_id
-        manages_sandbox_checkout = (
-            donation["sandbox_payment"] and session.get("parish_id") == donation["parish_id"]
-        )
-        if not (owns_checkout or manages_sandbox_checkout):
-            abort(404)
-        if donation["sandbox_payment"]:
-            if request.method == "GET" and request.args.get("pix_status") == "1":
-                return {"version": int(donation["paid_at"] is not None)}
-            return sandbox_payment(donation)
-        if request.method == "POST":
-            with db() as connection:
-                mark_paid(connection, donation_id)
-            return redirect(url_for("demo_payment", donation_id=donation_id))
-        return render_template("payment.html", donation=donation)
+        with db():
+            action=request.form.get('action')
+            if action=='optout':
+                db().execute('UPDATE member SET opted_out_at=? WHERE id=?',(stamp(),member_id))
+                db().execute("UPDATE message SET status='cancelled' WHERE member_id=? AND status='queued'",(member_id,))
+            elif action=='archive':
+                db().execute('UPDATE member SET active=1-active WHERE id=?',(member_id,))
+            audit(member['parish_id'],'member_updated',action or '',current_user()['id'])
+        return redirect(url_for('people'))
 
-    def mark_paid(connection, donation_id):
-        connection.execute(
-            "UPDATE donation SET paid_at = ? WHERE id = ? AND paid_at IS NULL",
-            (now().isoformat(), donation_id),
-        )
+    def save_reminders(parish):
+        day=request.form.get('day','')
+        hour=request.form.get('time','')
+        chosen=set(request.form.getlist('methods'))
+        body=request.form.get('body',parish['reminder_body']).strip()
+        if not re.fullmatch(r'(?:[1-9]|[12][0-9]|3[01])',day) or not re.fullmatch(r'(?:[01][0-9]|2[0-3]):[0-5][0-9]',hour) or not chosen<=METHODS.keys() or not 10<=len(body)<=700:
+            flash('Confira dia, horário, mensagem e formas de pagamento.')
+            return
+        with db():
+            db().execute('UPDATE parish SET reminder_day=?,reminder_time=?,reminder_body=?,reminder_enabled=?,methods=? WHERE id=?',(int(day),hour,body,int(request.form.get('enabled')=='on'),','.join(method for method in METHODS if method in chosen),parish['id']))
+            audit(parish['id'],'reminders_updated',user_id=current_user()['id'])
+        flash('Preferências salvas.')
 
-    @app.post("/webhooks/asaas")
-    def asaas_webhook():
-        if not webhook_token:
-            abort(404)
-        provided = request.headers.get("asaas-access-token", "")
-        if not hmac.compare_digest(provided.encode(), webhook_token.encode()):
-            abort(401)
+    @app.route('/lembretes',methods=['GET','POST'])
+    @require('reminders')
+    def reminders():
+        parish=current_parish()
+        if request.method=='POST':
+            save_reminders(parish)
+            return redirect(url_for('reminders'))
+        sample={'name':'Maria','manage_token':'exemplo'}
+        messages=db().execute('SELECT message.*,member.name FROM message JOIN member ON member.id=message.member_id WHERE message.parish_id=? ORDER BY message.id DESC LIMIT 50',(parish['id'],)).fetchall()
+        return render_template('reminders.html',parish=parish,preview=messaging.reminder_text(parish,sample),messages=messages)
 
-        payload = request.get_json(silent=True)
-        if not isinstance(payload, dict) or not isinstance(payload.get("event"), str):
-            abort(400)
-        if payload["event"] not in ("PAYMENT_RECEIVED", "PAYMENT_CONFIRMED"):
-            return {"received": True}
+    @app.post('/lembretes/processar')
+    @require('reminders')
+    def queue_reminders():
+        count=messaging.enqueue_reminders(force_parish=current_parish()['id'])
+        messaging.send_queue()
+        flash(f'{count} lembrete(s) adicionado(s) para este mês. Os cadastros já processados não são repetidos.')
+        return redirect(url_for('reminders'))
 
-        event_id = payload.get("id")
-        payment = payload.get("payment")
-        if not isinstance(event_id, str) or not 1 <= len(event_id) <= 255 or not isinstance(payment, dict):
-            abort(400)
-        payment_id = payment.get("id")
-        if not isinstance(payment_id, str) or not payment_id:
-            abort(400)
-
-        with db() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            if connection.execute("SELECT 1 FROM asaas_webhook_event WHERE id = ?", (event_id,)).fetchone():
-                return {"received": True}
-            donation = connection.execute("""
-                SELECT donation.id, donation.amount, donation.method, asaas_payment.payment_id
-                FROM asaas_payment JOIN donation ON donation.id = asaas_payment.donation_id
-                WHERE asaas_payment.payment_id = ?
-            """, (payment_id,)).fetchone()
-            if donation is not None:
-                if payment_confirmed(payment, donation) and matches_payment(payment, donation):
-                    mark_paid(connection, donation["id"])
-                    connection.execute(
-                        "INSERT INTO asaas_webhook_event (id, donation_id) VALUES (?, ?)",
-                        (event_id, donation["id"]),
-                    )
-                else:
-                    app.logger.warning("Webhook do Asaas ignorado: dados divergentes da contribuição.")
-        return {"received": True}
-
-    def create_sandbox_charge(donation):
-        reference = "dizipy-" + donation["id"]
-        api_key = app.config["ASAAS_API_KEY"]
-        customer_id = app.config["ASAAS_CUSTOMER_ID"]
-        # Serializa tentativas de geração e recupera uma cobrança criada antes de uma falha local.
-        with db() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT payment_id FROM asaas_payment WHERE donation_id = ?", (donation["id"],),
-            ).fetchone()
-            if row["payment_id"]:
-                return
-            result = asaas.call(api_key, "GET", "/payments", params={
-                "externalReference": reference, "customer": customer_id, "limit": 2,
-            })
-            matches = result.get("data")
-            if not isinstance(matches, list) or len(matches) > 1:
-                raise asaas.AsaasError("Não foi possível identificar uma única cobrança no Sandbox.")
-            payment = matches[0] if matches else asaas.call(api_key, "POST", "/payments", data={
-                "customer": customer_id,
-                "billingType": ASAAS_METHODS[donation["method"]],
-                "value": donation["amount"] / 100,
-                "dueDate": now().date().isoformat(),
-                "description": "Contribuição de teste Dizipy",
-                "externalReference": reference,
-            })
-            if not isinstance(payment, dict) or payment.get("externalReference") != reference:
-                raise asaas.AsaasError("A referência da cobrança retornada pelo Asaas diverge da contribuição.")
-            payment_id = payment.get("id")
-            if not isinstance(payment_id, str) or not re.fullmatch(r"pay_[A-Za-z0-9_]+", payment_id):
-                raise asaas.AsaasError("O Asaas Sandbox não devolveu um identificador de cobrança válido.")
-            connection.execute(
-                "UPDATE asaas_payment SET payment_id = ? WHERE donation_id = ?", (payment_id, donation["id"]),
-            )
-
-    def sandbox_payment(donation):
-        qr = None
-        invoice_url = None
-        payment_id = donation["payment_id"]
-        if not donation["paid_at"]:
-            if not sandbox_enabled:
-                flash("Configure o Asaas Sandbox para continuar com esta cobrança.")
+    @app.route('/colaboradores',methods=['GET','POST'])
+    @require('owner')
+    def staff():
+        parish=current_parish()
+        if request.method=='POST':
+            email=request.form.get('email','').strip().lower()
+            name=request.form.get('name','').strip()
+            password=request.form.get('password','')
+            permissions=set(request.form.getlist('permissions'))
+            if not valid_email(email) or not 2<=len(name)<=120 or not 10<=len(password)<=128 or not permissions<=PERMISSIONS.keys():
+                flash('Confira nome, e-mail, senha e permissões.')
             else:
                 try:
-                    if request.method == "POST":
-                        if payment_id:
-                            payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
-                            if not matches_payment(payment, donation):
-                                raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
-                            if payment_confirmed(payment, donation):
-                                with db() as connection:
-                                    mark_paid(connection, donation["id"])
-                            else:
-                                flash("O Asaas ainda não registrou o recebimento da cobrança.")
-                        else:
-                            create_sandbox_charge(donation)
-                    elif payment_id:
-                        payment = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}")
-                        if not matches_payment(payment, donation):
-                            raise asaas.AsaasError("Os dados da cobrança divergem da contribuição no Dizipy.")
-                        if payment_confirmed(payment, donation):
-                            with db() as connection:
-                                mark_paid(connection, donation["id"])
-                            return redirect(url_for("demo_payment", donation_id=donation["id"]))
-                        if donation["method"] == "pix":
-                            qr = asaas.call(app.config["ASAAS_API_KEY"], "GET", f"/payments/{payment_id}/pixQrCode")
-                        else:
-                            candidate_url = payment.get("invoiceUrl")
-                            if not isinstance(candidate_url, str):
-                                raise asaas.AsaasError("O Asaas não retornou o link da fatura de teste.")
-                            try:
-                                parsed_url = urlsplit(candidate_url)
-                            except ValueError:
-                                raise asaas.AsaasError("O Asaas retornou um endereço de fatura inválido.") from None
-                            if (parsed_url.scheme != "https"
-                                    or parsed_url.netloc not in ("sandbox.asaas.com", "sandbox.asaas.com:443")):
-                                raise asaas.AsaasError("O Asaas retornou um endereço de fatura inesperado.")
-                            invoice_url = candidate_url
+                    with db():
+                        db().execute("INSERT INTO app_user(parish_id,name,email,password_hash,role,permissions) VALUES(?,?,?,?,'staff',?)",(parish['id'],name,email,generate_password_hash(password),json.dumps(sorted(permissions))))
+                        audit(parish['id'],'staff_created',email,current_user()['id'])
+                    flash('Colaborador cadastrado.')
+                except sqlite3.IntegrityError:
+                    flash('Esse e-mail já está em uso.')
+            return redirect(url_for('staff'))
+        users=db().execute("SELECT * FROM app_user WHERE parish_id=? AND role='staff' ORDER BY name",(parish['id'],)).fetchall()
+        return render_template('staff.html',users=users)
+
+    @app.post('/colaboradores/<int:user_id>')
+    @require('owner')
+    def update_staff(user_id):
+        target=db().execute("SELECT * FROM app_user WHERE id=? AND parish_id=? AND role='staff'",(user_id,current_parish()['id'])).fetchone()
+        if not target:
+            abort(404)
+        permissions=set(request.form.getlist('permissions'))
+        if not permissions<=PERMISSIONS.keys():
+            abort(400)
+        with db():
+            db().execute('UPDATE app_user SET active=?,permissions=? WHERE id=?',(int(request.form.get('active')=='on'),json.dumps(sorted(permissions)),user_id))
+            password=request.form.get('password','')
+            if password:
+                if not 10<=len(password)<=128:
+                    abort(400)
+                db().execute('UPDATE app_user SET password_hash=? WHERE id=?',(generate_password_hash(password),user_id))
+            audit(target['parish_id'],'staff_updated',str(user_id),current_user()['id'])
+        return redirect(url_for('staff'))
+
+    @app.route('/integracoes',methods=['GET','POST'])
+    @require('owner')
+    def integrations():
+        parish=current_parish()
+        if request.method=='POST':
+            action=request.form.get('action','save')
+            if action=='check':
+                try:
+                    status=services.api(parish['id'],'GET','/myAccount/status/')
+                    with db():
+                        db().execute('UPDATE parish SET account_status=?,account_id=? WHERE id=?',(status.get('general','PENDING'),status.get('id'),parish['id']))
+                        audit(parish['id'],'account_checked',status.get('general','PENDING'),current_user()['id'])
+                    flash('Situação cadastral atualizada pelo Asaas Sandbox.')
                 except asaas.AsaasError as error:
                     flash(str(error))
-                except sqlite3.OperationalError as error:
-                    if "database is locked" not in str(error):
-                        raise
-                    flash("O Dizipy está finalizando outra tentativa. Tente novamente.")
-        if request.method == "POST":
-            return redirect(url_for("demo_payment", donation_id=donation["id"]))
-        return render_template("payment.html", donation=donation, qr=qr, invoice_url=invoice_url, sandbox_enabled=sandbox_enabled)
+            else:
+                with db():
+                    key=request.form.get('asaas_key','').strip()
+                    if key:
+                        put_setting('asaas_key',key,parish['id'],secret=True)
+                        db().execute("UPDATE parish SET account_status='PENDING',account_id=NULL WHERE id=?",(parish['id'],))
+                    put_setting('pix_key',request.form.get('pix_key','').strip(),parish['id'],secret=True)
+                    if not setting('asaas_webhook_token',parish_id=parish['id']):
+                        put_setting('asaas_webhook_token',secrets.token_hex(32),parish['id'],secret=True)
+                    audit(parish['id'],'payment_integration_updated',user_id=current_user()['id'])
+                flash('Configuração salva localmente. Confira a situação da conta.')
+            return redirect(url_for('integrations'))
+        token=setting('asaas_webhook_token',parish_id=parish['id']) or setting('asaas_webhook_token')
+        return render_template('integrations.html',parish=parish,has_key=bool(services.api_key(parish['id'])),hook_token=token,hook_path='/webhooks/asaas/'+parish['public_id'])
+
+    @app.route('/plataforma',methods=['GET','POST'])
+    @require()
+    def platform():
+        local_admin()
+        if request.method=='POST':
+            new_mode=request.form.get('mode','demo')
+            whatsapp_mode=request.form.get('whatsapp_mode','demo')
+            public=request.form.get('public_url','').strip().rstrip('/')
+            webhook=request.form.get('webhook_url','').strip().rstrip('/')
+            if webhook and not re.fullmatch(r'https://[^\s/?#]+(?::[0-9]+)?',webhook):
+                flash('Informe um endereço HTTPS válido para o receptor.')
+                return redirect(url_for('platform'))
+            if new_mode not in ('demo','sandbox') or whatsapp_mode not in ('demo','cloud') or (public and not re.fullmatch(r'https?://[^\s/?#]+(?::[0-9]+)?',public)):
+                flash('Confira o ambiente e o endereço público sem caminhos adicionais.')
+                return redirect(url_for('platform'))
+            with db():
+                for name in ('public_url','webhook_url','whatsapp_phone_id','whatsapp_version','whatsapp_template','whatsapp_language','whatsapp_number','platform_wallet'):
+                    value=request.form.get(name,'').strip()
+                    if len(value)>500:
+                        abort(400)
+                    put_setting(name,value)
+                put_setting('mode',new_mode)
+                put_setting('whatsapp_mode',whatsapp_mode)
+                for name in ('whatsapp_token','whatsapp_app_secret'):
+                    value=request.form.get(name,'').strip()
+                    if value:
+                        put_setting(name,value,secret=True)
+                audit(current_parish()['id'],'platform_settings_updated',new_mode,current_user()['id'])
+            flash('Configurações centrais salvas. A configuração de produção será feita após a homologação.')
+            return redirect(url_for('platform'))
+        keys=('public_url','webhook_url','whatsapp_phone_id','whatsapp_version','whatsapp_template','whatsapp_language','whatsapp_number','platform_wallet')
+        settings={name:setting(name) for name in keys}
+        checks={'asaas':bool(setting('asaas_key')),'whatsapp':bool(setting('whatsapp_token')),'public':bool(setting('public_url'))}
+        return render_template('platform.html',settings=settings,checks=checks,verify_token=setting('whatsapp_verify_token'))
+
+    @app.get('/plataforma/backup')
+    @require()
+    def backup():
+        local_admin()
+        # O arquivo inclui todas as paróquias. Só o administrador da plataforma tem acesso.
+        import tempfile
+        import zipfile
+        with tempfile.TemporaryDirectory() as folder:
+            snapshot=Path(folder)/'dizipy.sqlite'
+            target=sqlite3.connect(snapshot)
+            db().backup(target)
+            target.close()
+            buffer=BytesIO()
+            with zipfile.ZipFile(buffer,'w',zipfile.ZIP_DEFLATED) as archive:
+                archive.write(snapshot,'dizipy.sqlite')
+                for name in ('local.key','session.key'):
+                    source=Path(app.config['DATABASE']).parent/name
+                    if source.exists():
+                        archive.write(source,name)
+        buffer.seek(0)
+        return send_file(buffer,mimetype='application/zip',as_attachment=True,download_name='dizipy-backup.zip')
+
+    @app.get('/atividade')
+    @require('owner')
+    def activity():
+        parish=current_parish()
+        events=db().execute('SELECT id,event,state,error,created_at FROM provider_event WHERE parish_id=? ORDER BY created_at DESC LIMIT 50',(parish['id'],)).fetchall()
+        history=db().execute('SELECT * FROM audit WHERE parish_id=? ORDER BY id DESC LIMIT 50',(parish['id'],)).fetchall()
+        return render_template('activity.html',events=events,history=history)
+
+    @app.post('/atividade/reprocessar')
+    @require('owner')
+    def retry_events():
+        with db():
+            db().execute("UPDATE provider_event SET state='pending',attempts=0,error='' WHERE parish_id=? AND state='failed'",(current_parish()['id'],))
+        services.work_events()
+        flash('Eventos pendentes reprocessados. Confira o resultado abaixo.')
+        return redirect(url_for('activity'))
+
+    @app.get('/recorrencias')
+    @require('finance')
+    def recurring_list():
+        items=db().execute('SELECT r.*,m.name FROM recurring r LEFT JOIN member m ON m.id=r.member_id WHERE r.parish_id=? ORDER BY r.created_at DESC',(current_parish()['id'],)).fetchall()
+        return render_template('recurring.html',items=items)
+
+    @app.post('/recorrencias/<recurring_id>/cancelar')
+    @require('owner')
+    def cancel_subscription(recurring_id):
+        item=db().execute('SELECT * FROM recurring WHERE id=? AND parish_id=?',(recurring_id,current_parish()['id'])).fetchone()
+        if not item:
+            abort(404)
+        try:
+            services.cancel_recurring(item)
+            flash('Recorrência cancelada. O histórico dos pagamentos permanece disponível.')
+        except asaas.AsaasError as error:
+            flash(str(error))
+        return redirect(url_for('recurring_list'))
+
+    @app.post('/recorrencias/simular-ciclo')
+    @require('owner')
+    def simulate_cycle():
+        today=now().date()
+        future=services.next_month(today,today.day)
+        services.demo_cycles(future,parish_id=current_parish()['id'])
+        flash('Próximo ciclo de demonstração gerado. As novas contribuições aguardam confirmação na tela de pagamento.')
+        return redirect(url_for('recurring_list'))
+
+    @app.get('/contribuir/<public_id>/qr')
+    def parish_qr(public_id):
+        parish_by_public(public_id)
+        url=services.public_url(url_for('contribute',public_id=public_id))
+        if url.startswith('/'):
+            url=request.host_url.rstrip('/')+url
+        return qr_response(url)
+
+    def save_member(parish_id, existing=None, public=False):
+        name=request.form.get('name','').strip()
+        phone=messaging.normalize_phone(request.form.get('phone',''))
+        email=request.form.get('email','').strip().lower()
+        document=re.sub(r'\D','',request.form.get('document',''))
+        if not 2<=len(name)<=120 or (email and not valid_email(email)) or (request.form.get('phone','').strip() and not phone):
+            raise ValueError('Confira nome, e-mail e telefone com DDD.')
+        if document and len(document) not in (11,14):
+            raise ValueError('Informe CPF com 11 dígitos ou CNPJ com 14 dígitos.')
+        duplicate=db().execute('SELECT id FROM member WHERE parish_id=? AND phone=? AND phone!=""',(parish_id,phone)).fetchone()
+        if duplicate and (not existing or duplicate['id']!=existing['id']):
+            raise ValueError('Esse telefone já está cadastrado. Use seu link pessoal ou peça ajuda à secretaria.')
+        consent=request.form.get('consent')=='on'
+        encrypted=secret_box().encrypt(document.encode()).decode() if document else ''
+        if existing:
+            # O telefone confirmado não pode ser substituído por um link público.
+            if public and phone!=existing['phone']:
+                raise ValueError('Para alterar seu telefone, entre em contato com a secretaria.')
+            db().execute('UPDATE member SET name=?,email=?,document=CASE WHEN ?!="" THEN ? ELSE document END WHERE id=?',(name,email,encrypted,encrypted,existing['id']))
+            if consent:
+                db().execute('UPDATE member SET consent_at=COALESCE(consent_at,?),opted_out_at=NULL,phone_verified_at=CASE WHEN ?="demo" THEN COALESCE(phone_verified_at,?) ELSE phone_verified_at END WHERE id=?',(stamp(),setting('whatsapp_mode'),stamp(),existing['id']))
+            return existing['id']
+        return db().execute('INSERT INTO member(parish_id,name,phone,email,document,manage_token,consent_at,created_at,phone_verified_at) VALUES(?,?,?,?,?,?,?,?,?)',(parish_id,name,phone,email,encrypted,secrets.token_urlsafe(24),stamp() if consent else None,stamp(),stamp() if consent and setting('whatsapp_mode')=='demo' else None)).lastrowid
+
+    @app.route('/contribuir/<public_id>',methods=['GET','POST'])
+    def contribute(public_id):
+        parish=parish_by_public(public_id)
+        token=request.args.get('pessoa') or session.get('member_tokens',{}).get(str(parish['id']))
+        member=db().execute('SELECT * FROM member WHERE manage_token=? AND parish_id=?',(token,parish['id'])).fetchone() if token else None
+        enabled=[method for method in parish['methods'].split(',') if method in METHODS]
+        mode=services.mode_for_new()
+        if request.method=='POST':
+            amount=services.parse_amount(request.form.get('amount','').strip())
+            method=request.form.get('method','')
+            if amount is None or method not in enabled:
+                flash('Escolha a forma disponível e informe um valor válido.')
+            elif method.endswith('monthly') and request.form.get('recurring_consent')!='on':
+                flash('Confirme a autorização da contribuição mensal antes de continuar.')
+            elif mode=='sandbox' and parish['account_status']!='APPROVED':
+                flash('A paróquia precisa verificar a conta recebedora antes de aceitar contribuições no Sandbox.')
+            else:
+                try:
+                    with db() as connection:
+                        member_id=save_member(parish['id'],member,public=True)
+                        recurring_id=None
+                        period=None
+                        if method.endswith('monthly'):
+                            recurring_id=secrets.token_urlsafe(18)
+                            today=now().date()
+                            period=today.isoformat()
+                            connection.execute('INSERT INTO recurring(id,parish_id,member_id,method,amount,mode,next_due,day,consent_at,created_at) VALUES(?,?,?,?,?,?,?,?,?,?)',(recurring_id,parish['id'],member_id,method,amount,mode,services.next_month(today,today.day).isoformat(),today.day,stamp(),stamp()))
+                        donation_id=services.new_donation(parish['id'],amount,method,member_id,recurring_id,period,mode)
+                        member=connection.execute('SELECT * FROM member WHERE id=?',(member_id,)).fetchone()
+                    tokens=dict(session.get('member_tokens',{}))
+                    tokens[str(parish['id'])]=member['manage_token']
+                    session['member_tokens']=tokens
+                    session['demo_donation']=donation_id
+                    return redirect(url_for('demo_payment',donation_id=donation_id))
+                except sqlite3.IntegrityError:
+                    flash('Este cadastro já foi utilizado. Volte ao seu link pessoal ou tente novamente.')
+                except ValueError as error:
+                    flash(str(error))
+        return render_template('contribute.html',parish=parish,member=member,enabled=enabled)
+
+    def accessible_donation(donation_id):
+        donation=db().execute('SELECT d.*,p.name AS parish_name,p.public_id,a.payment_id,m.manage_token FROM donation d JOIN parish p ON p.id=d.parish_id LEFT JOIN asaas_payment a ON a.donation_id=d.id LEFT JOIN member m ON m.id=d.member_id WHERE d.id=?',(donation_id,)).fetchone()
+        if donation is None:
+            abort(404)
+        user=current_user()
+        owner=user and user['parish_id']==donation['parish_id'] and allowed('finance')
+        tokens=session.get('member_tokens',{})
+        personal=donation['manage_token'] and tokens.get(str(donation['parish_id']))==donation['manage_token']
+        if not (owner or personal or session.get('demo_donation')==donation_id):
+            abort(404)
+        return donation
+
+    @app.route('/simulacao/<donation_id>',methods=['GET','POST'])
+    def demo_payment(donation_id):
+        donation=accessible_donation(donation_id)
+        version=donation['status']+'|'+str(donation['settled_at'] or '')
+        if request.method=='GET' and request.args.get('pix_status')=='1':
+            return {'version':version}
+        if request.method=='POST':
+            action=request.form.get('action','')
+            try:
+                if donation['mode']=='demo':
+                    services.simulate(donation_id,action or 'pay')
+                elif action=='create' or not donation['payment_id']:
+                    services.ensure_charge(donation_id)
+                else:
+                    services.refresh_charge(donation_id)
+            except (asaas.AsaasError,ValueError) as error:
+                flash(str(error))
+            return redirect(url_for('demo_payment',donation_id=donation_id))
+        recurring=db().execute('SELECT * FROM recurring WHERE id=?',(donation['recurring_id'],)).fetchone() if donation['recurring_id'] else None
+        user=current_user()
+        show_personal=bool(session.get('demo_donation')==donation_id or session.get('member_tokens',{}).get(str(donation['parish_id']))==donation['manage_token'] or (user and user['role']=='owner'))
+        return render_template('payment.html',donation=donation,recurring=recurring,version=version,show_personal=show_personal)
+
+    @app.get('/simulacao/<donation_id>/qr')
+    def payment_qr(donation_id):
+        donation=accessible_donation(donation_id)
+        if not donation['qr_payload']:
+            abort(404)
+        return qr_response(donation['qr_payload'])
+
+    @app.route('/pessoa/<token>',methods=['GET','POST'])
+    def member_portal(token):
+        member=db().execute('SELECT m.*,p.name AS parish_name,p.public_id FROM member m JOIN parish p ON p.id=m.parish_id WHERE m.manage_token=?',(token,)).fetchone()
+        if not member:
+            abort(404)
+        tokens=dict(session.get('member_tokens',{}))
+        tokens[str(member['parish_id'])]=token
+        session['member_tokens']=tokens
+        if request.method=='POST':
+            action=request.form.get('action')
+            if action=='optout':
+                with db():
+                    db().execute('UPDATE member SET opted_out_at=? WHERE id=?',(stamp(),member['id']))
+                    db().execute("UPDATE message SET status='cancelled' WHERE member_id=? AND status='queued'",(member['id'],))
+                flash('Lembretes cancelados.')
+            elif action=='cancel':
+                recurring=db().execute('SELECT * FROM recurring WHERE id=? AND member_id=?',(request.form.get('recurring_id'),member['id'])).fetchone()
+                if not recurring:
+                    abort(404)
+                try:
+                    services.cancel_recurring(recurring)
+                    flash('Contribuição mensal cancelada.')
+                except asaas.AsaasError as error:
+                    flash(str(error))
+            return redirect(url_for('member_portal',token=token))
+        donations=db().execute('SELECT * FROM donation WHERE member_id=? ORDER BY created_at DESC LIMIT 30',(member['id'],)).fetchall()
+        recurring=db().execute('SELECT * FROM recurring WHERE member_id=? ORDER BY created_at DESC',(member['id'],)).fetchall()
+        central=setting('whatsapp_number')
+        optin_url='https://wa.me/'+central+'?text='+quote('ATIVAR '+token) if re.fullmatch(r'\d{10,15}',central) else ''
+        return render_template('member.html',member=member,donations=donations,recurring=recurring,optin_url=optin_url)
+
+    @app.post('/webhooks/asaas')
+    @app.post('/webhooks/asaas/<public_id>')
+    def asaas_webhook(public_id=None):
+        parish=parish_by_public(public_id) if public_id else None
+        token=(setting('asaas_webhook_token',parish_id=parish['id']) if parish else '') or setting('asaas_webhook_token')
+        supplied=request.headers.get('asaas-access-token','')
+        if not token or not hmac.compare_digest(supplied.encode(),token.encode()):
+            abort(401)
+        body=request.get_json(silent=True)
+        if not isinstance(body,dict) or not isinstance(body.get('id'),str) or not 1<=len(body['id'])<=255 or not isinstance(body.get('event'),str):
+            abort(400)
+        if parish is None:
+            payment=body.get('payment',{})
+            mapped=db().execute('SELECT p.* FROM parish p JOIN donation d ON d.parish_id=p.id JOIN asaas_payment a ON a.donation_id=d.id WHERE a.payment_id=?',(payment.get('id'),)).fetchone() if isinstance(payment,dict) else None
+            if not mapped and isinstance(payment,dict):
+                mapped=db().execute('SELECT p.* FROM parish p JOIN recurring r ON r.parish_id=p.id WHERE r.provider_subscription=?',(payment.get('subscription'),)).fetchone()
+            parish=mapped
+            if not parish:
+                return {'received':True,'ignored':True}
+        # Persiste somente os campos necessários à conciliação, sem dados de cartão.
+        minimal={'id':body['id'],'event':body['event'],'dateCreated':body.get('dateCreated'),'accountStatus':body.get('accountStatus',{})}
+        for resource in ('payment','subscription','authorization'):
+            value=body.get(resource)
+            if isinstance(value,dict):
+                minimal[resource]={key:value[key] for key in ('id','deleted','status') if key in value}
+        with db():
+            db().execute('INSERT OR IGNORE INTO provider_event(id,parish_id,event,payload,created_at) VALUES(?,?,?,?,?)',(body['id'],parish['id'],body['event'],json.dumps(minimal),stamp()))
+        return {'received':True}
+
+    @app.route('/webhooks/whatsapp',methods=['GET','POST'])
+    def whatsapp_webhook():
+        if request.method=='GET':
+            supplied=request.args.get('hub.verify_token','')
+            expected=setting('whatsapp_verify_token')
+            if request.args.get('hub.mode')=='subscribe' and expected and hmac.compare_digest(supplied.encode(),expected.encode()):
+                return Response(request.args.get('hub.challenge',''),mimetype='text/plain')
+            abort(403)
+        if not messaging.valid_signature(request.get_data(),request.headers.get('X-Hub-Signature-256','')):
+            abort(401)
+        body=request.get_json(silent=True)
+        if not isinstance(body,dict):
+            abort(400)
+        messaging.process_inbound(body)
+        return {'received':True}
+
+    @app.cli.command('asaas-cliente-teste')
+    def asaas_test_customer():
+        key=setting('asaas_key')
+        if not key:
+            raise click.ClickException('Configure a chave do Sandbox em Integrações.')
+        try:
+            customer=asaas.call(key,'POST','/customers',data={'name':'Cliente Teste Dizipy','cpfCnpj':'24971563792','notificationDisabled':True})
+        except asaas.AsaasError as error:
+            raise click.ClickException(str(error)) from None
+        click.echo(customer['id'])
+
+    @app.cli.command('processar-agenda')
+    def process_schedule():
+        from runner import tick
+        tick(app)
+        click.echo('Agenda processada.')
 
     return app
 
 
 def create_webhook_app():
-    """Mantém a interface local fora do túnel usado pelo Asaas."""
     return create_app(webhook_only=True)
+
+
+def valid_email(value):
+    return len(value)<=254 and re.fullmatch(r'[^\s@]+@[^\s@]+\.[^\s@]+',value)
+
+
+def csv_safe(value):
+    value=str(value)
+    return "'"+value if value and value[0] in '=+-@\t\r\n' else value
+
+
+def qr_response(value):
+    buffer=BytesIO()
+    qrcode.make(value).save(buffer,format='PNG')
+    buffer.seek(0)
+    return send_file(buffer,mimetype='image/png')
